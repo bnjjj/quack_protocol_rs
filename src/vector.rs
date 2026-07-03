@@ -681,7 +681,7 @@ fn decode_fixed_value(
             let lower = reader.read_fixed_u64()?;
             let upper = reader.read_fixed_i64()?;
             if logical_type.id == LogicalTypeId::Uuid {
-                Value::String(uuid_from_huge_int_parts(upper, lower))
+                Value::String(HugeIntParts { upper, lower }.to_string())
             } else {
                 let value = combine_signed_huge_int(HugeIntParts { upper, lower });
                 if logical_type.id == LogicalTypeId::Decimal {
@@ -1177,19 +1177,6 @@ fn decode_sequence_value(logical_type: &LogicalType, value: i128) -> Result<Valu
         LogicalTypeId::BigInt => Ok(Value::Int(value as i64)),
         _ => decode_int64_logical_value(logical_type, value as i64),
     }
-}
-
-fn uuid_from_huge_int_parts(upper: i64, lower: u64) -> String {
-    let display_upper = (upper as u64) ^ (1u64 << 63);
-    let hex = format!("{display_upper:016x}{lower:016x}");
-    format!(
-        "{}-{}-{}-{}-{}",
-        &hex[0..8],
-        &hex[8..12],
-        &hex[12..16],
-        &hex[16..20],
-        &hex[20..32]
-    )
 }
 
 fn uuid_to_huge_int_parts(uuid: &str) -> Result<HugeIntParts> {

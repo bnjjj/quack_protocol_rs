@@ -1,5 +1,6 @@
 use std::sync::atomic::{AtomicU64, Ordering};
 
+use futures_util::{StreamExt, TryStreamExt};
 use indexmap::IndexMap;
 use quack_protocol::*;
 
@@ -49,6 +50,49 @@ fn assert_decimal(value: &Value, unscaled: i128, width: u64, scale: u64) {
     }
 }
 
+/// Buffered view of a query stream, mirroring the pre-streaming API shape.
+struct Collected {
+    names: Vec<String>,
+    types: Vec<LogicalType>,
+    chunks: Vec<DataChunk>,
+}
+
+impl Collected {
+    fn rows(&self) -> Result<Vec<Row>> {
+        let mut rows = Vec::new();
+        for chunk in &self.chunks {
+            rows.extend(rows_from_chunk(chunk)?);
+        }
+        Ok(rows)
+    }
+
+    fn values(&self) -> Result<Vec<Value>> {
+        let first_name = match self.names.first() {
+            Some(name) => name.as_str(),
+            None => return Ok(Vec::new()),
+        };
+        Ok(self
+            .rows()?
+            .into_iter()
+            .map(|mut row| row.shift_remove(first_name).unwrap_or(Value::Null))
+            .collect())
+    }
+}
+
+async fn collect(mut stream: QuackResultStream) -> Result<Collected> {
+    let chunks: Vec<DataChunk> = (&mut stream).try_collect().await?;
+    let (names, types) = stream
+        .columns()
+        .iter()
+        .map(|column| (column.name.clone(), column.logical_type.clone()))
+        .unzip();
+    Ok(Collected {
+        names,
+        types,
+        chunks,
+    })
+}
+
 #[tokio::test]
 async fn live_quack_basic_query_when_configured() -> Result<()> {
     let Some(mut client) = live_client().await? else {
@@ -69,6 +113,7 @@ async fn live_quack_basic_query_when_configured() -> Result<()> {
             None,
         )
         .await?;
+    let result = collect(result).await?;
 
     assert_eq!(result.names, vec!["id", "label"]);
     assert_eq!(
@@ -105,6 +150,7 @@ async fn live_quack_preserves_empty_result_schema() -> Result<()> {
             None,
         )
         .await?;
+    let result = collect(result).await?;
 
     assert_eq!(result.names, vec!["id", "label"]);
     assert_eq!(
@@ -123,12 +169,16 @@ async fn live_quack_round_trips_scalar_types() -> Result<()> {
         return Ok(());
     };
     let enum_name = unique_name("quack_rust_mood");
-    client
-        .query(
-            &format!("CREATE TYPE {enum_name} AS ENUM ('sad', 'ok', 'happy')"),
-            None,
-        )
-        .await?;
+    // The stream is lazy: DDL only executes once the stream is polled.
+    collect(
+        client
+            .query(
+                &format!("CREATE TYPE {enum_name} AS ENUM ('sad', 'ok', 'happy')"),
+                None,
+            )
+            .await?,
+    )
+    .await?;
 
     let result = client
         .query(
@@ -170,6 +220,7 @@ async fn live_quack_round_trips_scalar_types() -> Result<()> {
             None,
         )
         .await?;
+    let result = collect(result).await?;
 
     assert_eq!(
         result.types.iter().map(|typ| typ.id).collect::<Vec<_>>(),
@@ -327,6 +378,7 @@ async fn live_quack_round_trips_nested_types() -> Result<()> {
             None,
         )
         .await?;
+    let result = collect(result).await?;
 
     assert_eq!(
         result.types.iter().map(|typ| typ.id).collect::<Vec<_>>(),
@@ -398,6 +450,7 @@ async fn live_quack_fetches_large_results_and_sequence_vectors() -> Result<()> {
     let result = client
         .query("SELECT i FROM range(5000) t(i) ORDER BY i", None)
         .await?;
+    let result = collect(result).await?;
     let values = result.values()?;
 
     assert_eq!(values.len(), 5000);
@@ -429,6 +482,7 @@ async fn live_quack_supports_parameterized_queries() -> Result<()> {
             ])),
         )
         .await?;
+    let result = collect(result).await?;
     assert_eq!(
         result.rows()?,
         vec![row(vec![
@@ -450,6 +504,7 @@ async fn live_quack_supports_parameterized_queries() -> Result<()> {
             Some(&SqlParameters::Named(named)),
         )
         .await?;
+    let result = collect(result).await?;
     assert_eq!(
         result.rows()?,
         vec![row(vec![
@@ -468,10 +523,12 @@ async fn live_quack_appends_scalar_and_nested_rows() -> Result<()> {
         return Ok(());
     };
     let table = unique_name("quack_rust_append");
-    client
-        .query(
-            &format!(
-                "
+    // The stream is lazy: DDL only executes once the stream is polled.
+    collect(
+        client
+            .query(
+                &format!(
+                    "
             CREATE TEMP TABLE {table} (
               id INTEGER,
               label VARCHAR,
@@ -481,10 +538,12 @@ async fn live_quack_appends_scalar_and_nested_rows() -> Result<()> {
               fixed INTEGER[3]
             )
             "
-            ),
-            None,
-        )
-        .await?;
+                ),
+                None,
+            )
+            .await?,
+    )
+    .await?;
 
     client
         .append_rows(
@@ -565,6 +624,7 @@ async fn live_quack_appends_scalar_and_nested_rows() -> Result<()> {
             None,
         )
         .await?;
+    let result = collect(result).await?;
     let rows = result.rows()?;
     assert_eq!(rows.len(), 2);
     assert_eq!(rows[0]["id"], Value::Int(1));
@@ -599,10 +659,14 @@ async fn live_quack_surfaces_server_errors() -> Result<()> {
         return Ok(());
     };
 
-    let error = client
+    // The stream is lazy, so the server error surfaces on first poll.
+    let mut stream = client
         .query("SELECT * FROM definitely_missing_quack_rust_table", None)
-        .await
-        .expect_err("query should fail");
+        .await?;
+    let error = match stream.next().await {
+        Some(Err(error)) => error,
+        other => panic!("query should fail, got {other:?}"),
+    };
     assert!(matches!(error, QuackError::Server(_)));
 
     client.disconnect().await?;
