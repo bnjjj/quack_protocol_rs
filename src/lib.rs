@@ -17,7 +17,9 @@ mod values;
 mod vector;
 
 pub use builders::{ColumnDefinition, ColumnInput, column, data_chunk, data_chunk_from_rows};
-pub use client::{QuackClient, QuackClientOptions, QuackConnectionInfo, QuackQueryResult};
+pub use client::{
+    QuackClient, QuackClientOptions, QuackConnectionInfo, QuackQueryResult, QueryMetadata,
+};
 pub use errors::{QuackError, Result};
 pub use json::{
     BigIntJsonMode, BytesJsonMode, JsonOptions, TaggedJsonMode, to_json_row, to_json_rows,

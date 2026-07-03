@@ -1,4 +1,4 @@
-use std::time::Duration;
+use std::time::{Duration, Instant};
 
 use reqwest::header::{ACCEPT, CONTENT_TYPE, HeaderMap, HeaderValue};
 
@@ -53,6 +53,12 @@ pub struct QuackConnectionInfo {
     pub server_duckdb_version: Option<String>,
     pub server_platform: Option<String>,
     pub quack_version: Option<u64>,
+}
+
+/// Caller-supplied metadata
+#[derive(Clone, Debug, Default, PartialEq, Eq)]
+pub struct QueryMetadata {
+    pub query_id: Option<String>,
 }
 
 #[derive(Clone, Debug, PartialEq)]
@@ -162,8 +168,12 @@ impl QuackClient {
         self.connection_id.is_some() && !self.closed
     }
 
-    pub async fn query(&mut self, sql: &str) -> Result<QuackQueryResult> {
-        self.query_with_params(sql, None).await
+    pub async fn query(
+        &mut self,
+        sql: &str,
+        metadata: Option<&QueryMetadata>,
+    ) -> Result<QuackQueryResult> {
+        self.query_inner(sql, None, metadata).await
     }
 
     pub async fn query_with_params(
@@ -171,7 +181,20 @@ impl QuackClient {
         sql: &str,
         params: Option<&SqlParameters>,
     ) -> Result<QuackQueryResult> {
+        self.query_inner(sql, params, None).await
+    }
+
+    async fn query_inner(
+        &mut self,
+        sql: &str,
+        params: Option<&SqlParameters>,
+        metadata: Option<&QueryMetadata>,
+    ) -> Result<QuackQueryResult> {
+        let query_id = metadata
+            .and_then(|metadata| metadata.query_id.as_deref())
+            .unwrap_or("-");
         let sql = format_sql(sql, params)?;
+        let query_started = Instant::now();
         let prepare = self.prepare(&sql).await?;
         let (result_types, result_names, mut needs_more_fetch, mut chunks, result_uuid) =
             match prepare {
@@ -197,11 +220,30 @@ impl QuackClient {
                 }
             };
 
+        let mut total_rows: usize = chunks.iter().map(|chunk| chunk.row_count).sum();
+        tracing::debug!(
+            query_id,
+            %result_uuid,
+            rows = total_rows,
+            elapsed_ms = query_started.elapsed().as_millis() as u64,
+            "quack PREPARE completed"
+        );
+
         attach_column_names(&mut chunks, &result_names);
         while needs_more_fetch {
+            let fetch_started = Instant::now();
             let fetch = self.fetch_result(result_uuid).await?;
             match fetch {
                 QuackMessage::FetchResponse { mut results, .. } => {
+                    let fetched_rows: usize = results.iter().map(|chunk| chunk.row_count).sum();
+                    total_rows += fetched_rows;
+                    tracing::debug!(
+                        query_id,
+                        result_uuid = %result_uuid,
+                        rows = fetched_rows,
+                        elapsed_ms = fetch_started.elapsed().as_millis() as u64,
+                        "quack FETCH completed"
+                    );
                     if results.is_empty() {
                         needs_more_fetch = false;
                     } else {
@@ -217,6 +259,13 @@ impl QuackClient {
                 }
             }
         }
+        tracing::debug!(
+            query_id,
+            %result_uuid,
+            rows = total_rows,
+            elapsed_ms = query_started.elapsed().as_millis() as u64,
+            "quack query completed"
+        );
         Ok(QuackQueryResult {
             names: result_names,
             types: result_types,
@@ -225,11 +274,11 @@ impl QuackClient {
     }
 
     pub async fn first(&mut self, sql: &str) -> Result<Option<Row>> {
-        Ok(self.query(sql).await?.rows()?.into_iter().next())
+        Ok(self.query(sql, None).await?.rows()?.into_iter().next())
     }
 
     pub async fn one(&mut self, sql: &str) -> Result<Row> {
-        let rows = self.query(sql).await?.rows()?;
+        let rows = self.query(sql, None).await?.rows()?;
         if rows.len() != 1 {
             return Err(QuackError::protocol(format!(
                 "expected exactly one row, got {}",
@@ -240,7 +289,7 @@ impl QuackClient {
     }
 
     pub async fn values(&mut self, sql: &str) -> Result<Vec<Value>> {
-        self.query(sql).await?.values()
+        self.query(sql, None).await?.values()
     }
 
     pub async fn append(

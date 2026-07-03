@@ -7,6 +7,24 @@ pub(crate) struct HugeIntParts {
     pub(crate) lower: u64,
 }
 
+impl std::fmt::Display for HugeIntParts {
+    /// Formats the value as a UUID string
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        // DuckDB stores UUIDs as HUGEINT with the most significant bit flipped;
+        // flip it back so the output matches the server-side UUID string.
+        let upper = (self.upper as u64) ^ (1u64 << 63);
+        write!(
+            f,
+            "{:08x}-{:04x}-{:04x}-{:04x}-{:012x}",
+            upper >> 32,
+            (upper >> 16) & 0xffff,
+            upper & 0xffff,
+            self.lower >> 48,
+            self.lower & 0x0000_ffff_ffff_ffff
+        )
+    }
+}
+
 #[derive(Clone, Debug, Default)]
 pub(crate) struct BinaryWriter {
     buffer: Vec<u8>,

@@ -66,6 +66,7 @@ async fn live_quack_basic_query_when_configured() -> Result<()> {
             ) AS t(id, label)
             ORDER BY id
             ",
+            None,
         )
         .await?;
 
@@ -99,7 +100,10 @@ async fn live_quack_preserves_empty_result_schema() -> Result<()> {
     };
 
     let result = client
-        .query("SELECT 1::INTEGER AS id, 'x'::VARCHAR AS label WHERE FALSE")
+        .query(
+            "SELECT 1::INTEGER AS id, 'x'::VARCHAR AS label WHERE FALSE",
+            None,
+        )
         .await?;
 
     assert_eq!(result.names, vec!["id", "label"]);
@@ -120,14 +124,16 @@ async fn live_quack_round_trips_scalar_types() -> Result<()> {
     };
     let enum_name = unique_name("quack_rust_mood");
     client
-        .query(&format!(
-            "CREATE TYPE {enum_name} AS ENUM ('sad', 'ok', 'happy')"
-        ))
+        .query(
+            &format!("CREATE TYPE {enum_name} AS ENUM ('sad', 'ok', 'happy')"),
+            None,
+        )
         .await?;
 
     let result = client
-        .query(&format!(
-            "
+        .query(
+            &format!(
+                "
             SELECT
               TRUE AS bool_v,
               127::TINYINT AS tiny_v,
@@ -160,7 +166,9 @@ async fn live_quack_round_trips_scalar_types() -> Result<()> {
               INTERVAL '1 month 2 days 3 microseconds' AS interval_v,
               'ok'::{enum_name} AS enum_v
             "
-        ))
+            ),
+            None,
+        )
         .await?;
 
     assert_eq!(
@@ -316,6 +324,7 @@ async fn live_quack_round_trips_nested_types() -> Result<()> {
               map(['a', 'b'], [1, 2]) AS map_v,
               array_value(7, 8, 9)::INTEGER[3] AS fixed_v
             ",
+            None,
         )
         .await?;
 
@@ -387,7 +396,7 @@ async fn live_quack_fetches_large_results_and_sequence_vectors() -> Result<()> {
     };
 
     let result = client
-        .query("SELECT i FROM range(5000) t(i) ORDER BY i")
+        .query("SELECT i FROM range(5000) t(i) ORDER BY i", None)
         .await?;
     let values = result.values()?;
 
@@ -460,8 +469,9 @@ async fn live_quack_appends_scalar_and_nested_rows() -> Result<()> {
     };
     let table = unique_name("quack_rust_append");
     client
-        .query(&format!(
-            "
+        .query(
+            &format!(
+                "
             CREATE TEMP TABLE {table} (
               id INTEGER,
               label VARCHAR,
@@ -471,7 +481,9 @@ async fn live_quack_appends_scalar_and_nested_rows() -> Result<()> {
               fixed INTEGER[3]
             )
             "
-        ))
+            ),
+            None,
+        )
         .await?;
 
     client
@@ -548,9 +560,10 @@ async fn live_quack_appends_scalar_and_nested_rows() -> Result<()> {
         .await?;
 
     let result = client
-        .query(&format!(
-            "SELECT id, label, amount, items, point, fixed FROM {table} ORDER BY id"
-        ))
+        .query(
+            &format!("SELECT id, label, amount, items, point, fixed FROM {table} ORDER BY id"),
+            None,
+        )
         .await?;
     let rows = result.rows()?;
     assert_eq!(rows.len(), 2);
@@ -587,7 +600,7 @@ async fn live_quack_surfaces_server_errors() -> Result<()> {
     };
 
     let error = client
-        .query("SELECT * FROM definitely_missing_quack_rust_table")
+        .query("SELECT * FROM definitely_missing_quack_rust_table", None)
         .await
         .expect_err("query should fail");
     assert!(matches!(error, QuackError::Server(_)));
