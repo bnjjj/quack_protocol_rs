@@ -50,49 +50,6 @@ fn assert_decimal(value: &Value, unscaled: i128, width: u64, scale: u64) {
     }
 }
 
-/// Buffered view of a query stream, mirroring the pre-streaming API shape.
-struct Collected {
-    names: Vec<String>,
-    types: Vec<LogicalType>,
-    chunks: Vec<DataChunk>,
-}
-
-impl Collected {
-    fn rows(&self) -> Result<Vec<Row>> {
-        let mut rows = Vec::new();
-        for chunk in &self.chunks {
-            rows.extend(rows_from_chunk(chunk)?);
-        }
-        Ok(rows)
-    }
-
-    fn values(&self) -> Result<Vec<Value>> {
-        let first_name = match self.names.first() {
-            Some(name) => name.as_str(),
-            None => return Ok(Vec::new()),
-        };
-        Ok(self
-            .rows()?
-            .into_iter()
-            .map(|mut row| row.shift_remove(first_name).unwrap_or(Value::Null))
-            .collect())
-    }
-}
-
-async fn collect(stream: QuackResultStream) -> Result<Collected> {
-    let (columns, chunk_stream) = stream.into_chunks();
-    let chunks: Vec<DataChunk> = chunk_stream.try_collect().await?;
-    let (names, types) = columns
-        .into_iter()
-        .map(|column| (column.name, column.logical_type))
-        .unzip();
-    Ok(Collected {
-        names,
-        types,
-        chunks,
-    })
-}
-
 #[tokio::test]
 async fn live_quack_basic_query_when_configured() -> Result<()> {
     let Some(client) = live_client().await? else {
@@ -113,15 +70,24 @@ async fn live_quack_basic_query_when_configured() -> Result<()> {
             None,
         )
         .await?;
-    let result = collect(result).await?;
+    let (columns, rows) = result.into_rows();
+    let rows: Vec<Row> = rows.try_collect().await?;
 
-    assert_eq!(result.names, vec!["id", "label"]);
     assert_eq!(
-        result.types.iter().map(|typ| typ.id).collect::<Vec<_>>(),
-        vec![LogicalTypeId::Integer, LogicalTypeId::Varchar]
+        columns,
+        vec![
+            ColumnDefinition {
+                name: "id".to_string(),
+                logical_type: LogicalTypes::integer(),
+            },
+            ColumnDefinition {
+                name: "label".to_string(),
+                logical_type: LogicalTypes::varchar(),
+            },
+        ]
     );
     assert_eq!(
-        result.rows()?,
+        rows,
         vec![
             row(vec![
                 ("id", Value::Int(1)),
@@ -150,14 +116,23 @@ async fn live_quack_preserves_empty_result_schema() -> Result<()> {
             None,
         )
         .await?;
-    let result = collect(result).await?;
+    let (columns, rows) = result.into_rows();
+    let rows: Vec<Row> = rows.try_collect().await?;
 
-    assert_eq!(result.names, vec!["id", "label"]);
     assert_eq!(
-        result.types.iter().map(|typ| typ.id).collect::<Vec<_>>(),
-        vec![LogicalTypeId::Integer, LogicalTypeId::Varchar]
+        columns,
+        vec![
+            ColumnDefinition {
+                name: "id".to_string(),
+                logical_type: LogicalTypes::integer(),
+            },
+            ColumnDefinition {
+                name: "label".to_string(),
+                logical_type: LogicalTypes::varchar(),
+            },
+        ]
     );
-    assert!(result.rows()?.is_empty());
+    assert!(rows.is_empty());
 
     client.disconnect().await?;
     Ok(())
@@ -170,15 +145,14 @@ async fn live_quack_round_trips_scalar_types() -> Result<()> {
     };
     let enum_name = unique_name("quack_rust_mood");
     // The stream is lazy: DDL only executes once the stream is polled.
-    collect(
-        client
-            .query(
-                &format!("CREATE TYPE {enum_name} AS ENUM ('sad', 'ok', 'happy')"),
-                None,
-            )
-            .await?,
-    )
-    .await?;
+    let (_, rows) = client
+        .query(
+            &format!("CREATE TYPE {enum_name} AS ENUM ('sad', 'ok', 'happy')"),
+            None,
+        )
+        .await?
+        .into_rows();
+    let _: Vec<Row> = rows.try_collect().await?;
 
     let result = client
         .query(
@@ -220,10 +194,15 @@ async fn live_quack_round_trips_scalar_types() -> Result<()> {
             None,
         )
         .await?;
-    let result = collect(result).await?;
+    let (columns, rows) = result.into_rows();
+    let types: Vec<LogicalTypeId> = columns
+        .iter()
+        .map(|column| column.logical_type.id)
+        .collect();
+    let rows: Vec<Row> = rows.try_collect().await?;
 
     assert_eq!(
-        result.types.iter().map(|typ| typ.id).collect::<Vec<_>>(),
+        types,
         vec![
             LogicalTypeId::Boolean,
             LogicalTypeId::TinyInt,
@@ -258,7 +237,6 @@ async fn live_quack_round_trips_scalar_types() -> Result<()> {
         ]
     );
 
-    let rows = result.rows()?;
     let row = &rows[0];
     assert_eq!(row["bool_v"], Value::Bool(true));
     assert_eq!(row["tiny_v"], Value::Int(127));
@@ -378,10 +356,15 @@ async fn live_quack_round_trips_nested_types() -> Result<()> {
             None,
         )
         .await?;
-    let result = collect(result).await?;
+    let (columns, rows) = result.into_rows();
+    let types: Vec<LogicalTypeId> = columns
+        .iter()
+        .map(|column| column.logical_type.id)
+        .collect();
+    let rows: Vec<Row> = rows.try_collect().await?;
 
     assert_eq!(
-        result.types.iter().map(|typ| typ.id).collect::<Vec<_>>(),
+        types,
         vec![
             LogicalTypeId::List,
             LogicalTypeId::List,
@@ -392,7 +375,6 @@ async fn live_quack_round_trips_nested_types() -> Result<()> {
         ]
     );
 
-    let rows = result.rows()?;
     let row = &rows[0];
     assert_eq!(
         row["ints"],
@@ -450,8 +432,13 @@ async fn live_quack_fetches_large_results_and_sequence_vectors() -> Result<()> {
     let result = client
         .query("SELECT i FROM range(5000) t(i) ORDER BY i", None)
         .await?;
-    let result = collect(result).await?;
-    let values = result.values()?;
+    let (columns, rows) = result.into_rows();
+    let first_name = columns[0].name.as_str();
+    let rows: Vec<Row> = rows.try_collect().await?;
+    let values: Vec<Value> = rows
+        .iter()
+        .map(|row| row.get(first_name).cloned().unwrap_or(Value::Null))
+        .collect();
 
     assert_eq!(values.len(), 5000);
     assert_eq!(values.first(), Some(&Value::Int(0)));
@@ -482,9 +469,10 @@ async fn live_quack_supports_parameterized_queries() -> Result<()> {
             ])),
         )
         .await?;
-    let result = collect(result).await?;
+    let (_, rows) = result.into_rows();
+    let rows: Vec<Row> = rows.try_collect().await?;
     assert_eq!(
-        result.rows()?,
+        rows,
         vec![row(vec![
             ("id", Value::Int(7)),
             ("label", Value::String("seven".to_string())),
@@ -504,9 +492,10 @@ async fn live_quack_supports_parameterized_queries() -> Result<()> {
             Some(&SqlParameters::Named(named)),
         )
         .await?;
-    let result = collect(result).await?;
+    let (_, rows) = result.into_rows();
+    let rows: Vec<Row> = rows.try_collect().await?;
     assert_eq!(
-        result.rows()?,
+        rows,
         vec![row(vec![
             ("id", Value::Int(8)),
             ("label", Value::String("eight".to_string())),
@@ -524,11 +513,10 @@ async fn live_quack_appends_scalar_and_nested_rows() -> Result<()> {
     };
     let table = unique_name("quack_rust_append");
     // The stream is lazy: DDL only executes once the stream is polled.
-    collect(
-        client
-            .query(
-                &format!(
-                    "
+    let (_, rows) = client
+        .query(
+            &format!(
+                "
             CREATE TEMP TABLE {table} (
               id INTEGER,
               label VARCHAR,
@@ -538,12 +526,12 @@ async fn live_quack_appends_scalar_and_nested_rows() -> Result<()> {
               fixed INTEGER[3]
             )
             "
-                ),
-                None,
-            )
-            .await?,
-    )
-    .await?;
+            ),
+            None,
+        )
+        .await?
+        .into_rows();
+    let _: Vec<Row> = rows.try_collect().await?;
 
     client
         .append_rows(
@@ -624,8 +612,8 @@ async fn live_quack_appends_scalar_and_nested_rows() -> Result<()> {
             None,
         )
         .await?;
-    let result = collect(result).await?;
-    let rows = result.rows()?;
+    let (_, rows) = result.into_rows();
+    let rows: Vec<Row> = rows.try_collect().await?;
     assert_eq!(rows.len(), 2);
     assert_eq!(rows[0]["id"], Value::Int(1));
     assert_eq!(rows[0]["label"], Value::String("one".to_string()));

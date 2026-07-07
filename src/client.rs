@@ -367,15 +367,9 @@ impl QuackClient {
         schema_name: Option<String>,
         chunk: DataChunk,
     ) -> Result<()> {
-        self.connection.ensure_open()?;
-        let message = QuackMessage::AppendRequest {
-            header: self.connection.scoped_header(MessageType::AppendRequest),
-            schema_name,
-            table_name: table_name.into(),
-            append_chunk: chunk,
-        };
-        let response = self.connection.send(&message).await?;
-        expect_success(response)
+        self.connection
+            .append(table_name.into(), schema_name, chunk)
+            .await
     }
 
     pub async fn append_rows(
@@ -472,8 +466,25 @@ impl Connection {
         self.send(&message).await
     }
 
+    async fn append(
+        &self,
+        table_name: String,
+        schema_name: Option<String>,
+        chunk: DataChunk,
+    ) -> Result<()> {
+        self.ensure_open()?;
+        let message = QuackMessage::AppendRequest {
+            header: self.scoped_header(MessageType::AppendRequest),
+            schema_name,
+            table_name,
+            append_chunk: chunk,
+        };
+        let response = self.send(&message).await?;
+        expect_success(response)
+    }
+
     async fn disconnect(&self) -> Result<()> {
-        if self.closed.load(Ordering::Relaxed) {
+        if self.ensure_open().is_err() {
             return Ok(());
         }
         let message = QuackMessage::Disconnect {
