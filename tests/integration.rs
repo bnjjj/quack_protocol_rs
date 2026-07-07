@@ -1,6 +1,6 @@
 use std::sync::atomic::{AtomicU64, Ordering};
 
-use futures_util::{StreamExt, TryStreamExt};
+use futures_util::TryStreamExt;
 use indexmap::IndexMap;
 use quack_protocol::*;
 
@@ -79,12 +79,12 @@ impl Collected {
     }
 }
 
-async fn collect(mut stream: QuackResultStream) -> Result<Collected> {
-    let chunks: Vec<DataChunk> = (&mut stream).try_collect().await?;
-    let (names, types) = stream
-        .columns()
-        .iter()
-        .map(|column| (column.name.clone(), column.logical_type.clone()))
+async fn collect(stream: QuackResultStream) -> Result<Collected> {
+    let (columns, chunk_stream) = stream.into_chunks();
+    let chunks: Vec<DataChunk> = chunk_stream.try_collect().await?;
+    let (names, types) = columns
+        .into_iter()
+        .map(|column| (column.name, column.logical_type))
         .unzip();
     Ok(Collected {
         names,
@@ -95,7 +95,7 @@ async fn collect(mut stream: QuackResultStream) -> Result<Collected> {
 
 #[tokio::test]
 async fn live_quack_basic_query_when_configured() -> Result<()> {
-    let Some(mut client) = live_client().await? else {
+    let Some(client) = live_client().await? else {
         return Ok(());
     };
 
@@ -140,7 +140,7 @@ async fn live_quack_basic_query_when_configured() -> Result<()> {
 
 #[tokio::test]
 async fn live_quack_preserves_empty_result_schema() -> Result<()> {
-    let Some(mut client) = live_client().await? else {
+    let Some(client) = live_client().await? else {
         return Ok(());
     };
 
@@ -165,7 +165,7 @@ async fn live_quack_preserves_empty_result_schema() -> Result<()> {
 
 #[tokio::test]
 async fn live_quack_round_trips_scalar_types() -> Result<()> {
-    let Some(mut client) = live_client().await? else {
+    let Some(client) = live_client().await? else {
         return Ok(());
     };
     let enum_name = unique_name("quack_rust_mood");
@@ -360,7 +360,7 @@ async fn live_quack_round_trips_scalar_types() -> Result<()> {
 
 #[tokio::test]
 async fn live_quack_round_trips_nested_types() -> Result<()> {
-    let Some(mut client) = live_client().await? else {
+    let Some(client) = live_client().await? else {
         return Ok(());
     };
 
@@ -443,7 +443,7 @@ async fn live_quack_round_trips_nested_types() -> Result<()> {
 
 #[tokio::test]
 async fn live_quack_fetches_large_results_and_sequence_vectors() -> Result<()> {
-    let Some(mut client) = live_client().await? else {
+    let Some(client) = live_client().await? else {
         return Ok(());
     };
 
@@ -464,7 +464,7 @@ async fn live_quack_fetches_large_results_and_sequence_vectors() -> Result<()> {
 
 #[tokio::test]
 async fn live_quack_supports_parameterized_queries() -> Result<()> {
-    let Some(mut client) = live_client().await? else {
+    let Some(client) = live_client().await? else {
         return Ok(());
     };
 
@@ -519,7 +519,7 @@ async fn live_quack_supports_parameterized_queries() -> Result<()> {
 
 #[tokio::test]
 async fn live_quack_appends_scalar_and_nested_rows() -> Result<()> {
-    let Some(mut client) = live_client().await? else {
+    let Some(client) = live_client().await? else {
         return Ok(());
     };
     let table = unique_name("quack_rust_append");
@@ -655,17 +655,17 @@ async fn live_quack_appends_scalar_and_nested_rows() -> Result<()> {
 
 #[tokio::test]
 async fn live_quack_surfaces_server_errors() -> Result<()> {
-    let Some(mut client) = live_client().await? else {
+    let Some(client) = live_client().await? else {
         return Ok(());
     };
 
-    // The stream is lazy, so the server error surfaces on first poll.
-    let mut stream = client
+    // PREPARE runs during query(), so the server error surfaces at the await.
+    let error = match client
         .query("SELECT * FROM definitely_missing_quack_rust_table", None)
-        .await?;
-    let error = match stream.next().await {
-        Some(Err(error)) => error,
-        other => panic!("query should fail, got {other:?}"),
+        .await
+    {
+        Err(error) => error,
+        Ok(_) => panic!("query should fail"),
     };
     assert!(matches!(error, QuackError::Server(_)));
 

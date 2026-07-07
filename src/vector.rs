@@ -319,20 +319,6 @@ pub(crate) fn rows_from_chunk_with_names(chunk: &DataChunk, names: &[String]) ->
     Ok(rows)
 }
 
-pub(crate) fn chunks_to_rows(
-    chunks: &[DataChunk],
-    column_names: Option<&[String]>,
-) -> Result<Vec<Row>> {
-    let mut rows = Vec::new();
-    for chunk in chunks {
-        rows.extend(match column_names {
-            Some(names) => rows_from_chunk_with_names(chunk, names)?,
-            None => rows_from_chunk(chunk)?,
-        });
-    }
-    Ok(rows)
-}
-
 pub fn decimal_to_string(decimal: &DecimalValue) -> String {
     let negative = decimal.value < 0;
     let abs = if negative {

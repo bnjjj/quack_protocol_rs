@@ -1,21 +1,20 @@
-use std::pin::Pin;
-use std::sync::atomic::{AtomicU64, Ordering};
-use std::sync::{Arc, OnceLock};
-use std::task::{Context, Poll};
+use std::iter::zip;
+use std::sync::Arc;
+use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use std::time::{Duration, Instant};
 
 use async_stream::try_stream;
-use futures_core::Stream;
-use futures_util::TryStreamExt;
+use futures_util::stream::{self, BoxStream};
+use futures_util::{StreamExt, TryStreamExt};
 use reqwest::header::{ACCEPT, CONTENT_TYPE, HeaderMap, HeaderValue};
 
-use crate::LogicalType;
+use crate::binary::HugeIntParts;
 use crate::builders::{ColumnDefinition, data_chunk_from_rows};
 use crate::constants::{DEFAULT_QUACK_PORT, DUCKDB_MIME_TYPE, QUACK_ENDPOINT, QUACK_VERSION};
 use crate::errors::{QuackError, Result};
 use crate::messages::{MessageHeader, MessageType, QuackMessage, decode_message, encode_message};
 use crate::sql::{SqlParameters, format_sql};
-use crate::vector::{DataChunk, Row, Value, chunks_to_rows};
+use crate::vector::{DataChunk, Row, Value, rows_from_chunk_with_names};
 
 const DEFAULT_QUACK_REQUEST_TIMEOUT: Duration = Duration::from_secs(300);
 const DEFAULT_QUACK_CONNECT_TIMEOUT: Duration = Duration::from_secs(10);
@@ -62,168 +61,56 @@ pub struct QuackConnectionInfo {
     pub quack_version: Option<u64>,
 }
 
-/// Caller-supplied metadata
-#[derive(Clone, Debug, Default, PartialEq, Eq)]
 pub struct QueryMetadata {
     pub query_id: Option<String>,
 }
 
-/// One column of a query result: its name zipped with its logical type.
-#[derive(Clone, Debug, PartialEq)]
-pub struct QuackResultColumn {
-    pub name: String,
-    pub logical_type: LogicalType,
-}
-
-/// Stream of query result chunks returned by [`QuackClient::query`].
-///
-/// Each item is one [`DataChunk`]. No network I/O happens until the stream
-/// is first polled: the PREPARE round-trip (which executes the query
-/// server-side) runs on the first poll, and further chunks are fetched
-/// lazily, one FETCH round-trip at a time; all chunks delivered by the same
-/// round-trip are yielded across consecutive polls without extra I/O.
-///
-/// The result schema is exposed via [`columns`](Self::columns) — populated
-/// once PREPARE completes, so guaranteed available after the first chunk (or
-/// end of stream) has been observed. An empty result yields no items; poll
-/// the stream to completion and read `columns()` for the schema. Chunks
-/// carry their column names, so [`rows_from_chunk`](crate::rows_from_chunk)
-/// decodes them directly.
-///
-/// Errors — including SQL errors surfaced by PREPARE — are yielded once as
-/// `Err`, after which the stream is terminated and yields `None` forever.
-#[must_use = "QuackResultStream is lazy: the query does not execute until the stream is polled"]
+#[must_use = "call into_rows() or into_chunks() to consume the query results"]
 pub struct QuackResultStream {
-    /// Shared with the generator backing `inner`, which fills it exactly once
-    /// when the PREPARE response arrives.
-    columns: Arc<OnceLock<Vec<QuackResultColumn>>>,
-    inner: Pin<Box<dyn Stream<Item = Result<DataChunk>> + Send>>,
+    columns: Vec<ColumnDefinition>,
+    inner: BoxStream<'static, Result<DataChunk>>,
 }
 
 impl QuackResultStream {
-    /// Builds the stream for one query. Constructing the generator here —
-    /// the only place `columns` can be paired with the future that fills it —
-    /// keeps the two from ever being wired up inconsistently.
-    fn new(client: QuackClient, sql: String, query_id: String) -> Self {
-        let columns = Arc::new(OnceLock::new());
-        let columns_cell = Arc::clone(&columns);
-        let inner = try_stream! {
-            let query_started = Instant::now();
-            let prepare = client.prepare(&sql).await?;
-            let (result_types, result_names, mut needs_more_fetch, mut chunks, result_uuid) =
-                match prepare {
-                    QuackMessage::PrepareResponse {
-                        result_types,
-                        result_names,
-                        needs_more_fetch,
-                        results,
-                        result_uuid,
-                        ..
-                    } => (
-                        result_types,
-                        result_names,
-                        needs_more_fetch,
-                        results,
-                        result_uuid,
-                    ),
-                    other => Err(QuackError::protocol(format!(
-                        "expected PREPARE_RESPONSE, got {:?}",
-                        other.message_type()
-                    )))?,
-                };
-
-            let mut total_rows: usize = chunks.iter().map(|chunk| chunk.row_count).sum();
-            tracing::debug!(
-                query_id = %query_id,
-                %result_uuid,
-                rows = total_rows,
-                elapsed_ms = query_started.elapsed().as_millis() as u64,
-                "quack PREPARE completed"
-            );
-
-            attach_column_names(&mut chunks, &result_names);
-            let _ = columns_cell.set(
-                result_names
-                    .iter()
-                    .zip(result_types)
-                    .map(|(name, logical_type)| QuackResultColumn {
-                        name: name.clone(),
-                        logical_type,
-                    })
-                    .collect(),
-            );
-
-            for chunk in chunks {
-                yield chunk;
-            }
-            while needs_more_fetch {
-                let fetch_started = Instant::now();
-                match client.fetch_result(result_uuid).await? {
-                    QuackMessage::FetchResponse { mut results, .. } => {
-                        let rows: usize = results.iter().map(|chunk| chunk.row_count).sum();
-                        total_rows += rows;
-                        tracing::debug!(
-                            query_id = %query_id,
-                            %result_uuid,
-                            rows,
-                            elapsed_ms = fetch_started.elapsed().as_millis() as u64,
-                            "quack FETCH completed"
-                        );
-                        if results.is_empty() {
-                            needs_more_fetch = false;
-                        } else {
-                            attach_column_names(&mut results, &result_names);
-                            for chunk in results {
-                                yield chunk;
-                            }
-                        }
-                    }
-                    other => Err(QuackError::protocol(format!(
-                        "expected FETCH_RESPONSE, got {:?}",
-                        other.message_type()
-                    )))?,
-                }
-            }
-            tracing::debug!(
-                query_id = %query_id,
-                %result_uuid,
-                rows = total_rows,
-                elapsed_ms = query_started.elapsed().as_millis() as u64,
-                "quack query completed"
-            );
-        };
+    fn new(columns: Vec<ColumnDefinition>, chunks: BoxStream<'static, Result<DataChunk>>) -> Self {
         Self {
             columns,
-            inner: Box::pin(inner),
+            inner: chunks,
         }
     }
 
-    /// Result schema. Empty until the PREPARE round-trip has completed on
-    /// first poll; guaranteed populated once the stream has yielded a chunk
-    /// or ended without error.
-    pub fn columns(&self) -> &[QuackResultColumn] {
-        self.columns.get().map(Vec::as_slice).unwrap_or(&[])
+    pub fn into_chunks(self) -> (Vec<ColumnDefinition>, BoxStream<'static, Result<DataChunk>>) {
+        (self.columns, self.inner)
+    }
+
+    pub fn into_rows(self) -> (Vec<ColumnDefinition>, BoxStream<'static, Result<Row>>) {
+        let col_names: Vec<String> = self.columns.iter().map(|col| col.name.to_owned()).collect();
+        let rows = self
+            .inner
+            .flat_map(move |chunk| {
+                stream::iter(
+                    match chunk.and_then(|chunk| rows_from_chunk_with_names(&chunk, &col_names)) {
+                        Ok(rows) => rows.into_iter().map(Ok).collect(),
+                        Err(err) => vec![Err(err)],
+                    },
+                )
+            })
+            .boxed();
+        (self.columns, rows)
     }
 }
 
-impl Stream for QuackResultStream {
-    type Item = Result<DataChunk>;
-
-    fn poll_next(self: Pin<&mut Self>, cx: &mut Context<'_>) -> Poll<Option<Self::Item>> {
-        self.get_mut().inner.as_mut().poll_next(cx)
-    }
+struct FetchState {
+    result_uuid: HugeIntParts,
+    needs_more_fetch: bool,
+    query_started: Instant,
+    rows_delivered: usize,
 }
 
 #[derive(Clone, Debug)]
 pub struct QuackClient {
-    pub(crate) base_url: String,
+    connection: Arc<Connection>,
     pub info: Option<QuackConnectionInfo>,
-    http: reqwest::Client,
-    headers: HeaderMap,
-    timeout: Duration,
-    connection_id: Option<String>,
-    closed: bool,
-    query_counter: Arc<AtomicU64>,
 }
 
 impl QuackClient {
@@ -234,17 +121,16 @@ impl QuackClient {
             .connect_timeout(DEFAULT_QUACK_CONNECT_TIMEOUT.min(timeout))
             .timeout(timeout)
             .build()?;
-        let mut client = Self {
+        let connection = Connection {
             base_url: parsed.base_url.trim_end_matches('/').to_string(),
-            info: None,
             http,
-            headers: options.headers.clone(),
+            headers: options.headers,
             timeout,
-            connection_id: None,
-            closed: false,
-            query_counter: Arc::new(AtomicU64::new(1)),
+            connection_id: String::new(),
+            query_counter: AtomicU64::new(1),
+            closed: AtomicBool::new(false),
         };
-        let response = client
+        let response = connection
             .send(&QuackMessage::ConnectionRequest {
                 header: MessageHeader::new(MessageType::ConnectionRequest),
                 auth_string: options.auth_token,
@@ -273,13 +159,17 @@ impl QuackClient {
                 let connection_id = header.connection_id.ok_or_else(|| {
                     QuackError::protocol("CONNECTION_RESPONSE did not include a connection id")
                 })?;
-                client.connection_id = Some(connection_id);
-                client.info = Some(QuackConnectionInfo {
-                    server_duckdb_version,
-                    server_platform,
-                    quack_version,
-                });
-                Ok(client)
+                Ok(Self {
+                    connection: Arc::new(Connection {
+                        connection_id,
+                        ..connection
+                    }),
+                    info: Some(QuackConnectionInfo {
+                        server_duckdb_version,
+                        server_platform,
+                        quack_version,
+                    }),
+                })
             }
             other => Err(QuackError::protocol(format!(
                 "expected CONNECTION_RESPONSE, got {:?}",
@@ -289,33 +179,15 @@ impl QuackClient {
     }
 
     pub fn is_connected(&self) -> bool {
-        self.connection_id.is_some() && !self.closed
+        !self.connection.closed.load(Ordering::Relaxed)
     }
 
-    /// Executes `sql` lazily, returning a stream of result chunks.
-    ///
-    /// No network I/O happens until the returned [`QuackResultStream`] is
-    /// first polled: the PREPARE round-trip (which executes the query
-    /// server-side and yields the first chunks) runs on the first poll, and
-    /// remaining chunks are fetched lazily, one round-trip at a time. This
-    /// also means errors — including SQL errors — surface as stream items,
-    /// not from awaiting `query` itself, and that a stream dropped without
-    /// being polled never executes the query.
-    ///
-    /// Dropping the stream at any point cancels the query client-side: any
-    /// in-flight request is aborted, no further FETCH requests are issued,
-    /// and the client remains fully usable. The protocol has no cancellation
-    /// message, so once PREPARE has run the server retains the result set
-    /// until the connection is closed via [`QuackClient::disconnect`].
-    ///
-    /// The configured request timeout applies to each round-trip
-    /// individually; the lifetime of the stream as a whole is unbounded.
     pub async fn query(
         &self,
         sql: &str,
         metadata: Option<&QueryMetadata>,
     ) -> Result<QuackResultStream> {
-        self.query_inner(sql, None, metadata)
+        self.query_inner(sql, None, metadata).await
     }
 
     pub async fn query_with_params(
@@ -323,31 +195,149 @@ impl QuackClient {
         sql: &str,
         params: Option<&SqlParameters>,
     ) -> Result<QuackResultStream> {
-        self.query_inner(sql, params, None)
+        self.query_inner(sql, params, None).await
     }
 
-    fn query_inner(
+    async fn query_inner(
         &self,
         sql: &str,
         params: Option<&SqlParameters>,
         metadata: Option<&QueryMetadata>,
     ) -> Result<QuackResultStream> {
-        self.ensure_open()?;
+        self.connection.ensure_open()?;
         let query_id = metadata
             .and_then(|metadata| metadata.query_id.as_deref())
             .unwrap_or("-")
             .to_string();
         let sql = format_sql(sql, params)?;
-        Ok(QuackResultStream::new(self.clone(), sql, query_id))
+        let (columns, chunks, fetch_state) = self.prepare(sql, query_id.clone()).await?;
+        let fetch_stream = self.fetch(fetch_state, &columns, query_id);
+
+        Ok(QuackResultStream::new(
+            columns,
+            stream::iter(chunks).map(Ok).chain(fetch_stream).boxed(),
+        ))
+    }
+
+    async fn prepare(
+        &self,
+        sql: String,
+        query_id: String,
+    ) -> Result<(Vec<ColumnDefinition>, Vec<DataChunk>, FetchState)> {
+        let query_started = Instant::now();
+        let (result_types, result_names, needs_more_fetch, mut chunks, result_uuid) =
+            match self.connection.prepare(&sql).await? {
+                QuackMessage::PrepareResponse {
+                    result_types,
+                    result_names,
+                    needs_more_fetch,
+                    results,
+                    result_uuid,
+                    ..
+                } => (
+                    result_types,
+                    result_names,
+                    needs_more_fetch,
+                    results,
+                    result_uuid,
+                ),
+                other => {
+                    return Err(QuackError::protocol(format!(
+                        "expected PREPARE_RESPONSE, got {:?}",
+                        other.message_type()
+                    )));
+                }
+            };
+
+        let rows: usize = chunks.iter().map(|chunk| chunk.row_count).sum();
+        tracing::debug!(
+            query_id = %query_id,
+            %result_uuid,
+            rows,
+            elapsed_ms = query_started.elapsed().as_millis() as u64,
+            "quack PREPARE completed"
+        );
+
+        attach_column_names(&mut chunks, &result_names);
+        let columns: Vec<ColumnDefinition> = zip(result_names, result_types)
+            .map(|(name, logical_type)| ColumnDefinition { name, logical_type })
+            .collect();
+        let fetch = FetchState {
+            result_uuid,
+            needs_more_fetch,
+            query_started,
+            rows_delivered: rows,
+        };
+        Ok((columns, chunks, fetch))
+    }
+
+    fn fetch(
+        &self,
+        state: FetchState,
+        columns: &[ColumnDefinition],
+        query_id: String,
+    ) -> BoxStream<'static, Result<DataChunk>> {
+        let connection = Arc::clone(&self.connection);
+        let FetchState {
+            result_uuid,
+            mut needs_more_fetch,
+            query_started,
+            mut rows_delivered,
+        } = state;
+        let column_names = columns
+            .iter()
+            .map(|col| col.name.to_owned())
+            .collect::<Vec<_>>();
+
+        Box::pin(try_stream! {
+            while needs_more_fetch {
+                let fetch_started = Instant::now();
+                let mut results = match connection.fetch(result_uuid).await? {
+                    QuackMessage::FetchResponse { results, .. } => results,
+                    other => Err(QuackError::protocol(format!(
+                        "expected FETCH_RESPONSE, got {:?}",
+                        other.message_type()
+                    )))?,
+                };
+
+                let rows: usize = results.iter().map(|chunk| chunk.row_count).sum();
+                rows_delivered += rows;
+                tracing::debug!(
+                    %query_id,
+                    %result_uuid,
+                    rows,
+                    elapsed_ms = fetch_started.elapsed().as_millis() as u64,
+                    "quack FETCH completed"
+                );
+
+                needs_more_fetch = !results.is_empty();
+                attach_column_names(&mut results, &column_names);
+                for chunk in results {
+                    yield chunk;
+                }
+            }
+
+            tracing::debug!(
+                %query_id,
+                %result_uuid,
+                rows = rows_delivered,
+                elapsed_ms = query_started.elapsed().as_millis() as u64,
+                "quack query completed"
+            );
+        })
     }
 
     pub async fn first(&self, sql: &str) -> Result<Option<Row>> {
-        let (_, rows) = drain_rows(self.query(sql, None).await?).await?;
+        let (_, rows) = self.query(sql, None).await?.into_rows();
+        let rows: Vec<_> = rows.try_collect().await?;
+
         Ok(rows.into_iter().next())
     }
 
     pub async fn one(&self, sql: &str) -> Result<Row> {
-        let (_, rows) = drain_rows(self.query(sql, None).await?).await?;
+        let (_, rows) = self.query(sql, None).await?.into_rows();
+        let rows: Vec<_> = rows.try_collect().await?;
+
         if rows.len() != 1 {
             return Err(QuackError::protocol(format!(
                 "expected exactly one row, got {}",
@@ -358,9 +348,11 @@ impl QuackClient {
     }
 
     pub async fn values(&self, sql: &str) -> Result<Vec<Value>> {
-        let (names, rows) = drain_rows(self.query(sql, None).await?).await?;
-        let first_name = match names.first() {
-            Some(name) => name.as_str(),
+        let (columns, rows) = self.query(sql, None).await?.into_rows();
+        let rows: Vec<_> = rows.try_collect().await?;
+
+        let first_name = match columns.first() {
+            Some(col) => &col.name,
             None => return Ok(Vec::new()),
         };
         Ok(rows
@@ -375,14 +367,14 @@ impl QuackClient {
         schema_name: Option<String>,
         chunk: DataChunk,
     ) -> Result<()> {
-        self.ensure_open()?;
+        self.connection.ensure_open()?;
         let message = QuackMessage::AppendRequest {
-            header: self.scoped_header(MessageType::AppendRequest)?,
+            header: self.connection.scoped_header(MessageType::AppendRequest),
             schema_name,
             table_name: table_name.into(),
             append_chunk: chunk,
         };
-        let response = self.send(&message).await?;
+        let response = self.connection.send(&message).await?;
         expect_success(response)
     }
 
@@ -413,26 +405,28 @@ impl QuackClient {
         Ok(())
     }
 
-    pub async fn disconnect(&mut self) -> Result<()> {
-        if self.closed || self.connection_id.is_none() {
-            self.closed = true;
-            return Ok(());
-        }
-        let message = QuackMessage::Disconnect {
-            header: self.scoped_header(MessageType::DisconnectMessage)?,
-        };
-        let response = self.send(&message).await?;
-        expect_success(response)?;
-        self.closed = true;
-        self.connection_id = None;
-        Ok(())
+    pub async fn disconnect(&self) -> Result<()> {
+        self.connection.disconnect().await
     }
 
-    pub async fn close(&mut self) -> Result<()> {
+    pub async fn close(&self) -> Result<()> {
         self.disconnect().await
     }
+}
 
-    pub(crate) async fn send(&self, message: &QuackMessage) -> Result<QuackMessage> {
+#[derive(Debug)]
+struct Connection {
+    base_url: String,
+    http: reqwest::Client,
+    headers: HeaderMap,
+    timeout: Duration,
+    connection_id: String,
+    query_counter: AtomicU64,
+    closed: AtomicBool,
+}
+
+impl Connection {
+    async fn send(&self, message: &QuackMessage) -> Result<QuackMessage> {
         let bytes = encode_message(message)?;
         let mut request = self
             .http
@@ -463,34 +457,43 @@ impl QuackClient {
     async fn prepare(&self, sql: &str) -> Result<QuackMessage> {
         self.ensure_open()?;
         let message = QuackMessage::PrepareRequest {
-            header: self.scoped_header(MessageType::PrepareRequest)?,
+            header: self.scoped_header(MessageType::PrepareRequest),
             sql: sql.to_string(),
         };
         self.send(&message).await
     }
 
-    async fn fetch_result(&self, result_uuid: crate::binary::HugeIntParts) -> Result<QuackMessage> {
+    async fn fetch(&self, result_uuid: HugeIntParts) -> Result<QuackMessage> {
         self.ensure_open()?;
         let message = QuackMessage::FetchRequest {
-            header: self.scoped_header(MessageType::FetchRequest)?,
+            header: self.scoped_header(MessageType::FetchRequest),
             result_uuid,
         };
         self.send(&message).await
     }
 
-    fn scoped_header(&self, message_type: MessageType) -> Result<MessageHeader> {
-        let connection_id = self
-            .connection_id
-            .clone()
-            .ok_or_else(|| QuackError::protocol("Quack client is not connected"))?;
+    async fn disconnect(&self) -> Result<()> {
+        if self.closed.load(Ordering::Relaxed) {
+            return Ok(());
+        }
+        let message = QuackMessage::Disconnect {
+            header: self.scoped_header(MessageType::DisconnectMessage),
+        };
+        let response = self.send(&message).await?;
+        expect_success(response)?;
+        self.closed.store(true, Ordering::Relaxed);
+        Ok(())
+    }
+
+    fn scoped_header(&self, message_type: MessageType) -> MessageHeader {
         let query_id = self.query_counter.fetch_add(1, Ordering::Relaxed);
-        Ok(MessageHeader::new(message_type)
-            .with_connection(connection_id)
-            .with_client_query_id(query_id))
+        MessageHeader::new(message_type)
+            .with_connection(self.connection_id.clone())
+            .with_client_query_id(query_id)
     }
 
     fn ensure_open(&self) -> Result<()> {
-        if self.closed || self.connection_id.is_none() {
+        if self.closed.load(Ordering::Relaxed) {
             Err(QuackError::protocol("Quack client is not connected"))
         } else {
             Ok(())
@@ -599,21 +602,6 @@ fn attach_column_names(chunks: &mut [DataChunk], names: &[String]) {
     for chunk in chunks {
         chunk.column_names = Some(names.to_vec());
     }
-}
-
-/// Drains a query stream into decoded rows plus the result column names.
-async fn drain_rows(mut stream: QuackResultStream) -> Result<(Vec<String>, Vec<Row>)> {
-    let mut chunks = Vec::new();
-    while let Some(chunk) = stream.try_next().await? {
-        chunks.push(chunk);
-    }
-    let names: Vec<String> = stream
-        .columns()
-        .iter()
-        .map(|column| column.name.clone())
-        .collect();
-    let rows = chunks_to_rows(&chunks, Some(&names))?;
-    Ok((names, rows))
 }
 
 fn expect_success(response: QuackMessage) -> Result<()> {
