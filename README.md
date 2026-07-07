@@ -11,11 +11,12 @@ The crate implements:
 - SQL literal formatting for positional and named parameters.
 
 ```rust
+use futures_util::TryStreamExt;
 use quack_protocol::{QuackClient, QuackClientOptions, Result};
 
 #[tokio::main]
 async fn main() -> Result<()> {
-    let mut client = QuackClient::connect(
+    let client = QuackClient::connect(
         "localhost:9494",
         QuackClientOptions {
             auth_token: Some("super_secret".to_string()),
@@ -24,8 +25,12 @@ async fn main() -> Result<()> {
     )
     .await?;
 
-    let result = client.query("SELECT 42::INTEGER AS answer").await?;
-    println!("{:?}", result.rows()?);
+    let (_columns, rows) = client
+        .query("SELECT 42::INTEGER AS answer", None)
+        .await?
+        .into_rows();
+    let rows: Vec<_> = rows.try_collect().await?;
+    println!("{:?}", rows);
 
     client.disconnect().await?;
     Ok(())
