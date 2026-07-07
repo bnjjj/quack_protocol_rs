@@ -101,6 +101,7 @@ impl QuackResultStream {
 }
 
 struct FetchState {
+    sql: String,
     result_uuid: HugeIntParts,
     needs_more_fetch: bool,
     query_started: Instant,
@@ -251,7 +252,8 @@ impl QuackClient {
 
         let rows: usize = chunks.iter().map(|chunk| chunk.row_count).sum();
         tracing::debug!(
-            query_id = %query_id,
+            query_id,
+            sql,
             %result_uuid,
             rows,
             elapsed_ms = query_started.elapsed().as_millis() as u64,
@@ -263,6 +265,7 @@ impl QuackClient {
             .map(|(name, logical_type)| ColumnDefinition { name, logical_type })
             .collect();
         let fetch = FetchState {
+            sql,
             result_uuid,
             needs_more_fetch,
             query_started,
@@ -279,6 +282,7 @@ impl QuackClient {
     ) -> BoxStream<'static, Result<DataChunk>> {
         let connection = Arc::clone(&self.connection);
         let FetchState {
+            sql,
             result_uuid,
             mut needs_more_fetch,
             query_started,
@@ -303,7 +307,8 @@ impl QuackClient {
                 let rows: usize = results.iter().map(|chunk| chunk.row_count).sum();
                 rows_delivered += rows;
                 tracing::debug!(
-                    %query_id,
+                    query_id,
+                    sql,
                     %result_uuid,
                     rows,
                     elapsed_ms = fetch_started.elapsed().as_millis() as u64,
@@ -318,7 +323,8 @@ impl QuackClient {
             }
 
             tracing::debug!(
-                %query_id,
+                query_id,
+                sql,
                 %result_uuid,
                 rows = rows_delivered,
                 elapsed_ms = query_started.elapsed().as_millis() as u64,
