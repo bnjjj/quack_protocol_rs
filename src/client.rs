@@ -183,6 +183,11 @@ impl QuackClient {
         !self.connection.closed.load(Ordering::Relaxed)
     }
 
+    pub async fn execute(&self, sql: &str, metadata: Option<&QueryMetadata>) -> Result<()> {
+        let (_, chunks) = self.query_inner(sql, None, metadata).await?.into_chunks();
+        chunks.try_for_each(|_| async { Ok(()) }).await
+    }
+
     pub async fn query(
         &self,
         sql: &str,
