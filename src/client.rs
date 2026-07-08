@@ -137,6 +137,7 @@ impl QuackClient {
         let timeout = options.timeout.unwrap_or(DEFAULT_QUACK_REQUEST_TIMEOUT);
         let http = reqwest::Client::builder()
             .connect_timeout(DEFAULT_QUACK_CONNECT_TIMEOUT.min(timeout))
+            .pool_max_idle_per_host(0)
             .timeout(timeout)
             .build()?;
         let base_url = parsed.base_url.trim_end_matches('/').to_string();
