@@ -7,6 +7,7 @@ use async_stream::try_stream;
 use futures_util::stream::{self, BoxStream};
 use futures_util::{StreamExt, TryStreamExt};
 use reqwest::header::{ACCEPT, CONTENT_TYPE, HeaderMap, HeaderValue};
+use tokio::sync::{Mutex, OwnedMutexGuard};
 
 use crate::binary::HugeIntParts;
 use crate::builders::{ColumnDefinition, data_chunk_from_rows};
@@ -101,6 +102,7 @@ impl QuackResultStream {
 }
 
 struct FetchState {
+    connection: OwnedMutexGuard<Connection>,
     sql: QuerySql,
     result_uuid: HugeIntParts,
     needs_more_fetch: bool,
@@ -110,7 +112,22 @@ struct FetchState {
 
 #[derive(Clone, Debug)]
 pub struct QuackClient {
-    connection: Arc<Connection>,
+    // Holds connection to Quack server.
+    //
+    // Server holds a resumable cursor for result-streaming per unique
+    // connection_id, and a `QuackClient` (its clones included, since they
+    // share this `Arc`) maps to exactly one connection_id for its whole
+    // lifetime. A concurrent PREPARE (e.g. from another query on this
+    // connection_id) resets the cursor, invalidating a FETCH still in
+    // progress. Connection is wrapped in Mutex to ensure queries are
+    // executed serially on server.
+    //
+    // TODO: support concurrent queries to quack server by introducing
+    // a connection pool
+    //
+    // TODO: close message is not issued to Quack server when `Connection` is
+    // dropped. Server retains the cursor for the dropped connection_id.
+    connection: Arc<Mutex<Connection>>,
     pub info: Option<QuackConnectionInfo>,
 }
 
@@ -122,65 +139,22 @@ impl QuackClient {
             .connect_timeout(DEFAULT_QUACK_CONNECT_TIMEOUT.min(timeout))
             .timeout(timeout)
             .build()?;
-        let connection = Connection {
-            base_url: parsed.base_url.trim_end_matches('/').to_string(),
-            http,
-            headers: options.headers,
-            timeout,
-            connection_id: String::new(),
-            query_counter: AtomicU64::new(1),
-            closed: AtomicBool::new(false),
-        };
-        let response = connection
-            .send(&QuackMessage::ConnectionRequest {
-                header: MessageHeader::new(MessageType::ConnectionRequest),
-                auth_string: options.auth_token,
-                client_duckdb_version: options.client_duckdb_version,
-                client_platform: Some(
-                    options
-                        .client_platform
-                        .unwrap_or_else(|| "quack-rust".to_string()),
-                ),
-                min_supported_quack_version: options
-                    .min_supported_quack_version
-                    .unwrap_or(QUACK_VERSION),
-                max_supported_quack_version: options
-                    .max_supported_quack_version
-                    .unwrap_or(QUACK_VERSION),
-            })
-            .await?;
+        let base_url = parsed.base_url.trim_end_matches('/').to_string();
+        let (connection, info) = Connection::connect(base_url, http, timeout, options).await?;
 
-        match response {
-            QuackMessage::ConnectionResponse {
-                header,
-                server_duckdb_version,
-                server_platform,
-                quack_version,
-            } => {
-                let connection_id = header.connection_id.ok_or_else(|| {
-                    QuackError::protocol("CONNECTION_RESPONSE did not include a connection id")
-                })?;
-                Ok(Self {
-                    connection: Arc::new(Connection {
-                        connection_id,
-                        ..connection
-                    }),
-                    info: Some(QuackConnectionInfo {
-                        server_duckdb_version,
-                        server_platform,
-                        quack_version,
-                    }),
-                })
-            }
-            other => Err(QuackError::protocol(format!(
-                "expected CONNECTION_RESPONSE, got {:?}",
-                other.message_type()
-            ))),
-        }
+        Ok(Self {
+            connection: Arc::new(Mutex::new(connection)),
+            info: Some(info),
+        })
     }
 
     pub fn is_connected(&self) -> bool {
-        !self.connection.closed.load(Ordering::Relaxed)
+        match self.connection.try_lock() {
+            Ok(guard) => !guard.closed.load(Ordering::Relaxed),
+            // Something's actively using the connection, so it can't be closed yet -
+            // closing requires this same lock.
+            Err(_) => true,
+        }
     }
 
     pub async fn execute(&self, sql: &str, metadata: Option<&QueryMetadata>) -> Result<()> {
@@ -204,18 +178,20 @@ impl QuackClient {
         self.query_inner(sql, params, None).await
     }
 
+    // Execute a SQL query on Quack server and stream results via repeated
+    // FETCH calls to server.
     async fn query_inner(
         &self,
         sql: &str,
         params: Option<&SqlParameters>,
         metadata: Option<&QueryMetadata>,
     ) -> Result<QuackResultStream> {
-        self.connection.ensure_open()?;
         let query_id = metadata
             .and_then(|metadata| metadata.query_id.as_deref())
             .unwrap_or("-")
             .to_string();
         let sql = QuerySql::new(format_sql(sql, params)?);
+
         let (columns, chunks, fetch_state) = self.prepare(sql, query_id.clone()).await?;
         let fetch_stream = self.fetch(fetch_state, &columns, query_id);
 
@@ -230,9 +206,13 @@ impl QuackClient {
         sql: QuerySql,
         query_id: String,
     ) -> Result<(Vec<ColumnDefinition>, Vec<DataChunk>, FetchState)> {
+        // Acquires the connection lock here and carries it forward via
+        // `FetchState` so the same lock stays held through every FETCH - see
+        // `client.connection` field docs.
+        let connection = Arc::clone(&self.connection).lock_owned().await;
         let query_started = Instant::now();
         let (result_types, result_names, needs_more_fetch, mut chunks, result_uuid) =
-            match self.connection.prepare(sql.as_str()).await? {
+            match connection.prepare(sql.as_str()).await? {
                 QuackMessage::PrepareResponse {
                     result_types,
                     result_names,
@@ -269,14 +249,16 @@ impl QuackClient {
         let columns: Vec<ColumnDefinition> = zip(result_names, result_types)
             .map(|(name, logical_type)| ColumnDefinition { name, logical_type })
             .collect();
-        let fetch = FetchState {
+
+        let fetch_state = FetchState {
+            connection,
             sql,
             result_uuid,
             needs_more_fetch,
             query_started,
             rows_delivered: rows,
         };
-        Ok((columns, chunks, fetch))
+        Ok((columns, chunks, fetch_state))
     }
 
     fn fetch(
@@ -285,8 +267,8 @@ impl QuackClient {
         columns: &[ColumnDefinition],
         query_id: String,
     ) -> BoxStream<'static, Result<DataChunk>> {
-        let connection = Arc::clone(&self.connection);
         let FetchState {
+            connection,
             sql,
             result_uuid,
             mut needs_more_fetch,
@@ -335,6 +317,10 @@ impl QuackClient {
                 elapsed_ms = query_started.elapsed().as_millis() as u64,
                 "quack query completed"
             );
+
+            // `connection` drops here and the lock is released for the next queued
+            // operation - the session on the Quack server stays open until
+            // `disconnect`/`close` is called
         })
     }
 
@@ -378,7 +364,8 @@ impl QuackClient {
         schema_name: Option<String>,
         chunk: DataChunk,
     ) -> Result<()> {
-        self.connection
+        let connection = self.connection.lock().await;
+        connection
             .append(table_name.into(), schema_name, chunk)
             .await
     }
@@ -411,7 +398,7 @@ impl QuackClient {
     }
 
     pub async fn disconnect(&self) -> Result<()> {
-        self.connection.disconnect().await
+        self.connection.lock().await.disconnect().await
     }
 
     pub async fn close(&self) -> Result<()> {
@@ -431,6 +418,70 @@ struct Connection {
 }
 
 impl Connection {
+    async fn connect(
+        base_url: String,
+        http: reqwest::Client,
+        timeout: Duration,
+        options: QuackClientOptions,
+    ) -> Result<(Self, QuackConnectionInfo)> {
+        let connection = Self {
+            base_url,
+            http,
+            headers: options.headers,
+            timeout,
+            connection_id: String::new(),
+            query_counter: AtomicU64::new(1),
+            closed: AtomicBool::new(false),
+        };
+        let response = connection
+            .send(&QuackMessage::ConnectionRequest {
+                header: MessageHeader::new(MessageType::ConnectionRequest),
+                auth_string: options.auth_token,
+                client_duckdb_version: options.client_duckdb_version,
+                client_platform: Some(
+                    options
+                        .client_platform
+                        .unwrap_or_else(|| "quack-rust".to_string()),
+                ),
+                min_supported_quack_version: options
+                    .min_supported_quack_version
+                    .unwrap_or(QUACK_VERSION),
+                max_supported_quack_version: options
+                    .max_supported_quack_version
+                    .unwrap_or(QUACK_VERSION),
+            })
+            .await?;
+
+        match response {
+            QuackMessage::ConnectionResponse {
+                header,
+                server_duckdb_version,
+                server_platform,
+                quack_version,
+            } => {
+                let connection_id = header.connection_id.ok_or_else(|| {
+                    QuackError::protocol("CONNECTION_RESPONSE did not include a connection id")
+                })?;
+                let info = QuackConnectionInfo {
+                    server_duckdb_version,
+                    server_platform,
+                    quack_version,
+                };
+                Ok((
+                    Self {
+                        connection_id,
+                        ..connection
+                    },
+                    info,
+                ))
+            }
+            other => Err(QuackError::protocol(format!(
+                "expected CONNECTION_RESPONSE, got {:?}",
+                other.message_type()
+            ))),
+        }
+    }
+
     async fn send(&self, message: &QuackMessage) -> Result<QuackMessage> {
         let bytes = encode_message(message)?;
         let mut request = self
