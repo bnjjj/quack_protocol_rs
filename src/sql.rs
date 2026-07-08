@@ -63,6 +63,45 @@ pub fn format_sql(sql: &str, params: Option<&SqlParameters>) -> Result<String> {
     }
 }
 
+pub(crate) struct QuerySql {
+    raw: String,
+    preview: String,
+}
+
+impl QuerySql {
+    const HEAD_LEN: usize = 10;
+    const TAIL_LEN: usize = 10;
+
+    pub(crate) fn new(raw: String) -> Self {
+        let collapsed = raw.split_whitespace().collect::<Vec<_>>().join(" ");
+        let chars: Vec<char> = collapsed.chars().collect();
+
+        let preview = if chars.len() <= Self::HEAD_LEN + Self::TAIL_LEN {
+            collapsed
+        } else {
+            format!(
+                "{}...{}",
+                chars[..Self::HEAD_LEN].iter().collect::<String>(),
+                chars[chars.len() - Self::TAIL_LEN..]
+                    .iter()
+                    .collect::<String>()
+            )
+        };
+
+        Self { raw, preview }
+    }
+
+    pub(crate) fn as_str(&self) -> &str {
+        &self.raw
+    }
+}
+
+impl std::fmt::Display for QuerySql {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.write_str(&self.preview)
+    }
+}
+
 pub fn sql_literal(value: &SqlParameter) -> Result<String> {
     match value {
         SqlParameter::List(values) => Ok(format!(

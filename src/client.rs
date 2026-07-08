@@ -13,7 +13,7 @@ use crate::builders::{ColumnDefinition, data_chunk_from_rows};
 use crate::constants::{DEFAULT_QUACK_PORT, DUCKDB_MIME_TYPE, QUACK_ENDPOINT, QUACK_VERSION};
 use crate::errors::{QuackError, Result};
 use crate::messages::{MessageHeader, MessageType, QuackMessage, decode_message, encode_message};
-use crate::sql::{SqlParameters, format_sql};
+use crate::sql::{QuerySql, SqlParameters, format_sql};
 use crate::vector::{DataChunk, Row, Value, rows_from_chunk_with_names};
 
 const DEFAULT_QUACK_REQUEST_TIMEOUT: Duration = Duration::from_secs(300);
@@ -101,7 +101,7 @@ impl QuackResultStream {
 }
 
 struct FetchState {
-    sql: String,
+    sql: QuerySql,
     result_uuid: HugeIntParts,
     needs_more_fetch: bool,
     query_started: Instant,
@@ -215,7 +215,7 @@ impl QuackClient {
             .and_then(|metadata| metadata.query_id.as_deref())
             .unwrap_or("-")
             .to_string();
-        let sql = format_sql(sql, params)?;
+        let sql = QuerySql::new(format_sql(sql, params)?);
         let (columns, chunks, fetch_state) = self.prepare(sql, query_id.clone()).await?;
         let fetch_stream = self.fetch(fetch_state, &columns, query_id);
 
@@ -227,12 +227,12 @@ impl QuackClient {
 
     async fn prepare(
         &self,
-        sql: String,
+        sql: QuerySql,
         query_id: String,
     ) -> Result<(Vec<ColumnDefinition>, Vec<DataChunk>, FetchState)> {
         let query_started = Instant::now();
         let (result_types, result_names, needs_more_fetch, mut chunks, result_uuid) =
-            match self.connection.prepare(&sql).await? {
+            match self.connection.prepare(sql.as_str()).await? {
                 QuackMessage::PrepareResponse {
                     result_types,
                     result_names,
@@ -258,7 +258,7 @@ impl QuackClient {
         let rows: usize = chunks.iter().map(|chunk| chunk.row_count).sum();
         tracing::debug!(
             query_id,
-            sql,
+            %sql,
             %result_uuid,
             rows,
             elapsed_ms = query_started.elapsed().as_millis() as u64,
@@ -313,7 +313,7 @@ impl QuackClient {
                 rows_delivered += rows;
                 tracing::debug!(
                     query_id,
-                    sql,
+                    %sql,
                     %result_uuid,
                     rows,
                     elapsed_ms = fetch_started.elapsed().as_millis() as u64,
@@ -329,7 +329,7 @@ impl QuackClient {
 
             tracing::debug!(
                 query_id,
-                sql,
+                %sql,
                 %result_uuid,
                 rows = rows_delivered,
                 elapsed_ms = query_started.elapsed().as_millis() as u64,
