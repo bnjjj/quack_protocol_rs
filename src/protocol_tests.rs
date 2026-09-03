@@ -1,8 +1,12 @@
 use indexmap::IndexMap;
 
 use crate::binary;
-use crate::client::{ParsedQuackUri, parse_quack_uri};
-use crate::messages::{MessageHeader, MessageType, QuackMessage, decode_message, encode_message};
+use crate::client::{ParsedQuackUri, is_version_negotiation_error, parse_quack_uri};
+use crate::constants::{QUACK_V1, QUACK_V3};
+use crate::messages::{
+    MessageHeader, MessageType, QuackMessage, decode_message, decode_message_for_version,
+    encode_message, encode_message_for_version,
+};
 use crate::sql::{format_sql, sql_literal};
 use crate::vector::{
     decode_data_chunk, encode_data_chunk, rows_from_chunk, rows_from_chunk_with_names,
@@ -226,6 +230,267 @@ fn messages_round_trip_prepare_response_with_results() {
         }
         other => panic!("unexpected message {other:?}"),
     }
+}
+
+#[test]
+fn protocol_v1_connection_request_omits_v3_lease_fields() {
+    let message = QuackMessage::ConnectionRequest {
+        header: MessageHeader::new(MessageType::ConnectionRequest),
+        auth_string: Some("token".to_string()),
+        client_duckdb_version: Some("v1.5.3".to_string()),
+        client_platform: Some("linux_amd64".to_string()),
+        min_supported_quack_version: QUACK_V1,
+        max_supported_quack_version: QUACK_V1,
+        client_id: Some("must-not-be-serialized".to_string()),
+        heartbeat_timeout_seconds: 60,
+    };
+
+    let decoded = decode_message_for_version(
+        &encode_message_for_version(&message, QUACK_V1).unwrap(),
+        QUACK_V1,
+    )
+    .unwrap();
+    match decoded {
+        QuackMessage::ConnectionRequest {
+            client_id,
+            heartbeat_timeout_seconds,
+            min_supported_quack_version,
+            max_supported_quack_version,
+            ..
+        } => {
+            assert_eq!(client_id, None);
+            assert_eq!(heartbeat_timeout_seconds, 0);
+            assert_eq!(min_supported_quack_version, QUACK_V1);
+            assert_eq!(max_supported_quack_version, QUACK_V1);
+        }
+        other => panic!("unexpected message {other:?}"),
+    }
+}
+
+#[test]
+fn negotiation_retries_v1_for_legacy_handshake_failures_but_not_authentication() {
+    assert!(is_version_negotiation_error(&QuackError::Protocol(
+        "Quack HTTP request failed with 500 Internal Server Error".to_string(),
+    )));
+    assert!(is_version_negotiation_error(&QuackError::Server(
+        "Unsupported Quack version - server only supports version 1 of quack".to_string(),
+    )));
+    assert!(!is_version_negotiation_error(&QuackError::Server(
+        "Authentication failed".to_string(),
+    )));
+}
+
+#[test]
+fn protocol_v1_prepare_and_fetch_requests_use_legacy_bodies() {
+    let uuid = binary::HugeIntParts {
+        upper: 123,
+        lower: 456,
+    };
+    let prepare = QuackMessage::PrepareRequest {
+        header: MessageHeader::new(MessageType::PrepareRequest).with_connection("conn-v1"),
+        sql: "SELECT 42".to_string(),
+        query_uuid: Some(uuid),
+        inline_rows: Some(1_000),
+    };
+    let fetch = QuackMessage::FetchRequest {
+        header: MessageHeader::new(MessageType::FetchRequest).with_connection("conn-v1"),
+        result_uuid: uuid,
+        batch_index: Some(7),
+        ack_index: Some(6),
+    };
+
+    match decode_message_for_version(
+        &encode_message_for_version(&prepare, QUACK_V1).unwrap(),
+        QUACK_V1,
+    )
+    .unwrap()
+    {
+        QuackMessage::PrepareRequest {
+            sql,
+            query_uuid,
+            inline_rows,
+            ..
+        } => {
+            assert_eq!(sql, "SELECT 42");
+            assert_eq!(query_uuid, None);
+            assert_eq!(inline_rows, None);
+        }
+        other => panic!("unexpected message {other:?}"),
+    }
+    match decode_message_for_version(
+        &encode_message_for_version(&fetch, QUACK_V1).unwrap(),
+        QUACK_V1,
+    )
+    .unwrap()
+    {
+        QuackMessage::FetchRequest {
+            result_uuid,
+            batch_index,
+            ack_index,
+            ..
+        } => {
+            assert_eq!(result_uuid, uuid);
+            assert_eq!(batch_index, None);
+            assert_eq!(ack_index, None);
+        }
+        other => panic!("unexpected message {other:?}"),
+    }
+}
+
+#[test]
+fn protocol_v1_fetch_and_append_round_trip_legacy_chunk_wrappers() {
+    let chunk = data_chunk(vec![column(
+        LogicalTypes::integer(),
+        vec![Value::Int(41), Value::Int(42)],
+        some_name("answer"),
+    )])
+    .unwrap();
+    let fetch = QuackMessage::FetchResponse {
+        header: MessageHeader::new(MessageType::FetchResponse).with_connection("conn-v1"),
+        results: vec![chunk.clone()],
+        total_batches: Some(99),
+        batch_index: None,
+    };
+    let append = QuackMessage::AppendRequest {
+        header: MessageHeader::new(MessageType::SendDataRequest).with_connection("conn-v1"),
+        schema_name: Some("main".to_string()),
+        table_name: "answers".to_string(),
+        append_chunk: chunk,
+    };
+
+    match decode_message_for_version(
+        &encode_message_for_version(&fetch, QUACK_V1).unwrap(),
+        QUACK_V1,
+    )
+    .unwrap()
+    {
+        QuackMessage::FetchResponse {
+            results,
+            total_batches,
+            batch_index,
+            ..
+        } => {
+            assert_eq!(results.len(), 1);
+            assert_eq!(total_batches, None);
+            assert_eq!(batch_index, None);
+        }
+        other => panic!("unexpected message {other:?}"),
+    }
+    match decode_message_for_version(
+        &encode_message_for_version(&append, QUACK_V1).unwrap(),
+        QUACK_V1,
+    )
+    .unwrap()
+    {
+        QuackMessage::AppendRequest {
+            schema_name,
+            table_name,
+            append_chunk,
+            ..
+        } => {
+            assert_eq!(schema_name.as_deref(), Some("main"));
+            assert_eq!(table_name, "answers");
+            assert_eq!(append_chunk.row_count, 2);
+        }
+        other => panic!("unexpected message {other:?}"),
+    }
+}
+
+#[test]
+fn protocol_v3_connection_request_round_trips_lease_fields() {
+    let message = QuackMessage::ConnectionRequest {
+        header: MessageHeader::new(MessageType::ConnectionRequest),
+        auth_string: Some("token".to_string()),
+        client_duckdb_version: Some("v2.0.0-alpha39998".to_string()),
+        client_platform: Some("linux_arm64".to_string()),
+        min_supported_quack_version: QUACK_V3,
+        max_supported_quack_version: QUACK_V3,
+        client_id: Some("quaxy-worker".to_string()),
+        heartbeat_timeout_seconds: 60,
+    };
+
+    assert_eq!(
+        decode_message(&encode_message(&message).unwrap()).unwrap(),
+        message
+    );
+}
+
+#[test]
+fn protocol_v3_prepare_and_fetch_requests_round_trip_indices() {
+    let query_uuid = binary::HugeIntParts {
+        upper: 123,
+        lower: 456,
+    };
+    let prepare = QuackMessage::PrepareRequest {
+        header: MessageHeader::new(MessageType::PrepareRequest).with_connection("conn-1"),
+        sql: "SELECT 42".to_string(),
+        query_uuid: Some(query_uuid),
+        inline_rows: Some(1_000),
+    };
+    let fetch = QuackMessage::FetchRequest {
+        header: MessageHeader::new(MessageType::FetchRequest).with_connection("conn-1"),
+        result_uuid: query_uuid,
+        batch_index: Some(7),
+        ack_index: Some(6),
+    };
+
+    assert_eq!(
+        decode_message(&encode_message(&prepare).unwrap()).unwrap(),
+        prepare
+    );
+    assert_eq!(
+        decode_message(&encode_message(&fetch).unwrap()).unwrap(),
+        fetch
+    );
+}
+
+#[test]
+fn protocol_v3_fetch_response_round_trips_raw_chunk_payloads() {
+    let chunk = data_chunk(vec![column(
+        LogicalTypes::integer(),
+        vec![Value::Int(41), Value::Int(42)],
+        some_name("answer"),
+    )])
+    .unwrap();
+    let message = QuackMessage::FetchResponse {
+        header: MessageHeader::new(MessageType::FetchResponse).with_connection("conn-1"),
+        results: vec![chunk],
+        total_batches: None,
+        batch_index: Some(1),
+    };
+
+    let decoded = decode_message(&encode_message(&message).unwrap()).unwrap();
+    match decoded {
+        QuackMessage::FetchResponse {
+            results,
+            total_batches,
+            batch_index,
+            ..
+        } => {
+            assert_eq!(total_batches, None);
+            assert_eq!(batch_index, Some(1));
+            assert_eq!(
+                rows_from_chunk_with_names(&results[0], &["answer".to_string()]).unwrap(),
+                vec![
+                    row(vec![("answer", Value::Int(41))]),
+                    row(vec![("answer", Value::Int(42))]),
+                ]
+            );
+        }
+        other => panic!("unexpected message {other:?}"),
+    }
+}
+
+#[test]
+fn protocol_v3_heartbeat_round_trips() {
+    let message = QuackMessage::HeartbeatRequest {
+        header: MessageHeader::new(MessageType::HeartbeatRequest).with_connection("conn-1"),
+    };
+
+    assert_eq!(
+        decode_message(&encode_message(&message).unwrap()).unwrap(),
+        message
+    );
 }
 
 #[test]
