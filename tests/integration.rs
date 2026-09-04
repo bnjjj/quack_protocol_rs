@@ -6,19 +6,19 @@ use quack_protocol::*;
 
 static NEXT_ID: AtomicU64 = AtomicU64::new(1);
 
+fn live_options() -> QuackClientOptions {
+    QuackClientOptions {
+        auth_token: std::env::var("QUACK_AUTH_TOKEN").ok(),
+        ..Default::default()
+    }
+}
+
 async fn live_client() -> Result<Option<QuackClient>> {
     let uri = match std::env::var("QUACK_SERVER_URI") {
         Ok(uri) => uri,
         Err(_) => return Ok(None),
     };
-    let client = QuackClient::connect(
-        &uri,
-        QuackClientOptions {
-            auth_token: std::env::var("QUACK_AUTH_TOKEN").ok(),
-            ..Default::default()
-        },
-    )
-    .await?;
+    let client = QuackClient::connect(&uri, live_options()).await?;
     Ok(Some(client))
 }
 
@@ -679,6 +679,471 @@ async fn live_quack_surfaces_server_errors() -> Result<()> {
 
     client.disconnect().await?;
     Ok(())
+}
+
+// The connection model: one `QuackClient` is one server-side session, a
+// `QuackPool` is several, and a session that nobody holds any more is closed.
+//
+// These tests need a server whose connection count belongs to them alone, so
+// each starts its own Quack server inside the server under test - `quack_serve`
+// is just SQL - and talks to that. `quack_server_list()` then reports exactly
+// the connections the test made. Ports are per-test to keep them independent.
+mod connection_model {
+    use std::time::Duration;
+
+    use futures_util::{StreamExt, TryStreamExt};
+    use quack_protocol::{
+        QuackClient, QuackPool, QuackPoolOptions, Result, SqlParameter, Value, sql_literal,
+    };
+    use tokio::time::{sleep, timeout};
+
+    use super::{live_options, unique_name};
+
+    // A server started by the tests is addressed by port, so each test picks
+    // its own out of this block.
+    const CONNECTIONS_ON_DROP_PORT: u16 = 19_601;
+    const CONCURRENT_STREAMS_PORT: u16 = 19_602;
+    const IDLE_REUSE_PORT: u16 = 19_603;
+    const EXHAUSTED_POOL_PORT: u16 = 19_604;
+    const RESTART_PORT: u16 = 19_605;
+    const POOL_CLOSE_PORT: u16 = 19_606;
+    const POOL_DROP_PORT: u16 = 19_607;
+    const ABANDONED_STREAM_PORT: u16 = 19_608;
+
+    // Control connection to the configured server, used to start, stop, and
+    // inspect the per-test server. `None` when no live server is configured.
+    async fn control() -> Result<Option<QuackClient>> {
+        super::live_client().await
+    }
+
+    fn nested_uri(port: u16) -> String {
+        format!("quack:127.0.0.1:{port}")
+    }
+
+    fn quoted(value: &str) -> Result<String> {
+        sql_literal(&SqlParameter::from(value))
+    }
+
+    async fn start_server(control: &QuackClient, port: u16) -> Result<String> {
+        let uri = nested_uri(port);
+        // A previous run that panicked may have left this port serving.
+        let _ = stop_server(control, port).await;
+        let token = match std::env::var("QUACK_AUTH_TOKEN") {
+            Ok(token) => format!(", token = {}", quoted(&token)?),
+            Err(_) => String::new(),
+        };
+        control
+            .execute(&format!("CALL quack_serve({}{token})", quoted(&uri)?), None)
+            .await?;
+        Ok(uri)
+    }
+
+    async fn stop_server(control: &QuackClient, port: u16) -> Result<()> {
+        control
+            .execute(
+                &format!("CALL quack_stop({})", quoted(&nested_uri(port))?),
+                None,
+            )
+            .await
+    }
+
+    async fn active_connections(control: &QuackClient, port: u16) -> Result<u64> {
+        let values = control
+            .values(&format!(
+                "SELECT active_connections FROM quack_server_list() WHERE port = {port}"
+            ))
+            .await?;
+        match values.first() {
+            Some(Value::UInt(count)) => Ok(*count),
+            other => panic!("unexpected active_connections {other:?}"),
+        }
+    }
+
+    // Sessions are closed from a background task, so the count settles shortly
+    // after the drop rather than at it.
+    async fn await_connections(control: &QuackClient, port: u16, expected: u64) -> Result<()> {
+        let mut last = active_connections(control, port).await?;
+        for _ in 0..100 {
+            if last == expected {
+                return Ok(());
+            }
+            sleep(Duration::from_millis(50)).await;
+            last = active_connections(control, port).await?;
+        }
+        panic!("expected {expected} connections on port {port}, still {last} after 5s");
+    }
+
+    #[tokio::test]
+    async fn live_quack_closes_the_session_when_the_client_is_dropped() -> Result<()> {
+        let Some(control) = control().await? else {
+            return Ok(());
+        };
+        let port = CONNECTIONS_ON_DROP_PORT;
+        let uri = start_server(&control, port).await?;
+
+        let client = QuackClient::connect(&uri, live_options()).await?;
+        assert_eq!(
+            client.values("SELECT 1::INTEGER").await?,
+            vec![Value::Int(1)]
+        );
+        assert_eq!(active_connections(&control, port).await?, 1);
+
+        // No disconnect call: dropping the last handle has to close the
+        // session, or the server keeps its cursor for a connection id nobody
+        // can use again.
+        drop(client);
+        await_connections(&control, port, 0).await?;
+
+        stop_server(&control, port).await?;
+        control.disconnect().await
+    }
+
+    #[tokio::test]
+    async fn live_quack_pool_streams_from_several_sessions_at_once() -> Result<()> {
+        let Some(control) = control().await? else {
+            return Ok(());
+        };
+        let port = CONCURRENT_STREAMS_PORT;
+        let uri = start_server(&control, port).await?;
+        let pool = QuackPool::connect(
+            &uri,
+            live_options(),
+            QuackPoolOptions { max_connections: 3 },
+        )
+        .await?;
+
+        // Three result streams open at the same time, each holding its own
+        // session. On a single client the second query would block behind the
+        // first stream, so this both times out and hangs without a pool.
+        let opened = timeout(Duration::from_secs(30), async {
+            let mut streams = Vec::new();
+            for _ in 0..3 {
+                let (_, chunks) = pool
+                    .query("SELECT i FROM range(100000) t(i)", None)
+                    .await?
+                    .into_chunks();
+                streams.push(chunks);
+            }
+            Ok::<_, quack_protocol::QuackError>(streams)
+        })
+        .await
+        .expect("three concurrent streams should open")?;
+        assert_eq!(active_connections(&control, port).await?, 3);
+
+        for chunks in opened {
+            let rows: usize = chunks
+                .try_fold(
+                    0usize,
+                    |rows, chunk| async move { Ok(rows + chunk.row_count) },
+                )
+                .await?;
+            assert_eq!(rows, 100_000);
+        }
+
+        pool.close().await?;
+        await_connections(&control, port, 0).await?;
+        stop_server(&control, port).await?;
+        control.disconnect().await
+    }
+
+    #[tokio::test]
+    async fn live_quack_pool_reuses_idle_connections() -> Result<()> {
+        let Some(control) = control().await? else {
+            return Ok(());
+        };
+        let port = IDLE_REUSE_PORT;
+        let uri = start_server(&control, port).await?;
+        let pool = QuackPool::connect(
+            &uri,
+            live_options(),
+            QuackPoolOptions { max_connections: 4 },
+        )
+        .await?;
+
+        // Sequential queries hand the same session back and forth instead of
+        // opening one per query.
+        for i in 0..20 {
+            assert_eq!(pool.values("SELECT 1::INTEGER").await?, vec![Value::Int(1)]);
+            assert_eq!(
+                active_connections(&control, port).await?,
+                1,
+                "query {i} opened a second connection"
+            );
+        }
+
+        pool.close().await?;
+        stop_server(&control, port).await?;
+        control.disconnect().await
+    }
+
+    #[tokio::test]
+    async fn live_quack_pool_lease_keeps_one_session() -> Result<()> {
+        let Some(control) = control().await? else {
+            return Ok(());
+        };
+        let port = EXHAUSTED_POOL_PORT;
+        let uri = start_server(&control, port).await?;
+        let pool = QuackPool::connect(
+            &uri,
+            live_options(),
+            QuackPoolOptions { max_connections: 1 },
+        )
+        .await?;
+
+        let table = unique_name("quack_rust_pool_temp");
+        let lease = pool.acquire().await?;
+        lease
+            .execute(
+                &format!("CREATE TEMP TABLE {table} AS SELECT 7::INTEGER AS answer"),
+                None,
+            )
+            .await?;
+        // Session state follows the lease, which is the reason to take one.
+        assert_eq!(
+            lease.values(&format!("SELECT answer FROM {table}")).await?,
+            vec![Value::Int(7)]
+        );
+
+        // The pool is exhausted while the lease is out.
+        assert!(
+            timeout(Duration::from_millis(250), pool.acquire())
+                .await
+                .is_err(),
+            "acquire should wait for the only connection"
+        );
+
+        drop(lease);
+        let next = timeout(Duration::from_secs(5), pool.acquire())
+            .await
+            .expect("a returned connection should unblock acquire")?;
+        // Same session, handed back: the temp table is still there.
+        assert_eq!(
+            next.values(&format!("SELECT answer FROM {table}")).await?,
+            vec![Value::Int(7)]
+        );
+        drop(next);
+
+        pool.close().await?;
+        stop_server(&control, port).await?;
+        control.disconnect().await
+    }
+
+    #[tokio::test]
+    async fn live_quack_pool_recycles_a_connection_from_an_abandoned_stream() -> Result<()> {
+        let Some(control) = control().await? else {
+            return Ok(());
+        };
+        let port = ABANDONED_STREAM_PORT;
+        let uri = start_server(&control, port).await?;
+        let pool = QuackPool::connect(
+            &uri,
+            live_options(),
+            QuackPoolOptions { max_connections: 1 },
+        )
+        .await?;
+
+        // A `LIMIT`-shaped read: take one chunk and walk away, leaving the
+        // server holding the rest of the cursor.
+        let (_, mut chunks) = pool
+            .query("SELECT i FROM range(100000) t(i)", None)
+            .await?
+            .into_chunks();
+        assert!(chunks.next().await.expect("a first chunk")?.row_count > 0);
+        drop(chunks);
+
+        // The pool's only connection comes back, and the next PREPARE on it
+        // clears the abandoned cursor rather than tripping over it.
+        assert_eq!(pool.values("SELECT 5::INTEGER").await?, vec![Value::Int(5)]);
+        assert_eq!(active_connections(&control, port).await?, 1);
+
+        pool.close().await?;
+        stop_server(&control, port).await?;
+        control.disconnect().await
+    }
+
+    #[tokio::test]
+    async fn live_quack_pool_replaces_connections_the_server_forgot() -> Result<()> {
+        let Some(control) = control().await? else {
+            return Ok(());
+        };
+        let port = RESTART_PORT;
+        let uri = start_server(&control, port).await?;
+        let pool = QuackPool::connect(
+            &uri,
+            live_options(),
+            QuackPoolOptions { max_connections: 2 },
+        )
+        .await?;
+        let client = QuackClient::connect(&uri, live_options()).await?;
+        assert_eq!(pool.values("SELECT 1::INTEGER").await?, vec![Value::Int(1)]);
+
+        // Restart the server behind their backs: every session opened against
+        // the old one is gone.
+        stop_server(&control, port).await?;
+        start_server(&control, port).await?;
+
+        // The pool retires the stale connection and retries on a fresh one.
+        // PREPARE is rejected before any SQL runs, so the retry cannot repeat
+        // a statement.
+        assert_eq!(pool.values("SELECT 2::INTEGER").await?, vec![Value::Int(2)]);
+
+        // A plain client does not reconnect: it is one session, and silently
+        // opening another would drop the session state that came with it.
+        let error = client
+            .values("SELECT 3::INTEGER")
+            .await
+            .expect_err("a stale session should surface");
+        assert!(error.is_connection_lost(), "{error}");
+
+        pool.close().await?;
+        stop_server(&control, port).await?;
+        control.disconnect().await
+    }
+
+    #[tokio::test]
+    async fn live_quack_pool_closes_every_session() -> Result<()> {
+        let Some(control) = control().await? else {
+            return Ok(());
+        };
+        let port = POOL_CLOSE_PORT;
+        let uri = start_server(&control, port).await?;
+        let pool = QuackPool::connect(
+            &uri,
+            live_options(),
+            QuackPoolOptions { max_connections: 2 },
+        )
+        .await?;
+
+        let first = pool.acquire().await?;
+        let second = pool.acquire().await?;
+        assert_eq!(active_connections(&control, port).await?, 2);
+        drop(first);
+        drop(second);
+
+        pool.close().await?;
+        assert_eq!(active_connections(&control, port).await?, 0);
+
+        let error = pool
+            .values("SELECT 1::INTEGER")
+            .await
+            .expect_err("a closed pool should refuse queries");
+        assert!(error.to_string().contains("closed"), "{error}");
+
+        stop_server(&control, port).await?;
+        control.disconnect().await
+    }
+
+    #[tokio::test]
+    async fn live_quack_pool_closes_its_sessions_when_dropped() -> Result<()> {
+        let Some(control) = control().await? else {
+            return Ok(());
+        };
+        let port = POOL_DROP_PORT;
+        let uri = start_server(&control, port).await?;
+        let pool = QuackPool::connect(
+            &uri,
+            live_options(),
+            QuackPoolOptions { max_connections: 2 },
+        )
+        .await?;
+        let first = pool.acquire().await?;
+        let second = pool.acquire().await?;
+        drop(first);
+        drop(second);
+        assert_eq!(active_connections(&control, port).await?, 2);
+
+        // No close call: the pool's connections are closed as it goes away.
+        drop(pool);
+        await_connections(&control, port, 0).await?;
+
+        stop_server(&control, port).await?;
+        control.disconnect().await
+    }
+
+    #[tokio::test]
+    async fn live_quack_pool_reports_server_info_and_size() -> Result<()> {
+        let Some(control) = control().await? else {
+            return Ok(());
+        };
+        let uri = std::env::var("QUACK_SERVER_URI").expect("configured above");
+        let pool = QuackPool::connect(
+            &uri,
+            live_options(),
+            QuackPoolOptions { max_connections: 2 },
+        )
+        .await?;
+        assert_eq!(pool.max_connections(), 2);
+        assert!(pool.info().is_some());
+        assert!(
+            pool.info()
+                .and_then(|info| info.quack_version)
+                .is_some_and(|version| version >= 1)
+        );
+        pool.close().await?;
+        control.disconnect().await
+    }
+
+    #[tokio::test]
+    async fn live_quack_pool_surfaces_sql_errors_without_retiring_connections() -> Result<()> {
+        let Some(control) = control().await? else {
+            return Ok(());
+        };
+        let uri = std::env::var("QUACK_SERVER_URI").expect("configured above");
+        let pool = QuackPool::connect(&uri, live_options(), QuackPoolOptions::default()).await?;
+
+        let error = match pool
+            .query("SELECT * FROM definitely_missing_quack_rust_table", None)
+            .await
+        {
+            Err(error) => error,
+            Ok(_) => panic!("query should fail"),
+        };
+        assert!(!error.is_connection_fatal(), "{error}");
+
+        // A failed statement leaves the session usable.
+        assert_eq!(pool.values("SELECT 8::INTEGER").await?, vec![Value::Int(8)]);
+        pool.close().await?;
+        control.disconnect().await
+    }
+
+    #[tokio::test]
+    async fn live_quack_pool_appends_rows() -> Result<()> {
+        let Some(control) = control().await? else {
+            return Ok(());
+        };
+        let uri = std::env::var("QUACK_SERVER_URI").expect("configured above");
+        let pool = QuackPool::connect(&uri, live_options(), QuackPoolOptions::default()).await?;
+
+        // An append lands in a table the whole server shares, so any session
+        // can read it back - unlike a temp table.
+        let table = unique_name("quack_rust_pool_append");
+        pool.execute(
+            &format!("CREATE TABLE {table} (id INTEGER, label VARCHAR)"),
+            None,
+        )
+        .await?;
+        let rows = vec![
+            super::row(vec![
+                ("id", Value::Int(1)),
+                ("label", Value::String("one".to_string())),
+            ]),
+            super::row(vec![
+                ("id", Value::Int(2)),
+                ("label", Value::String("two".to_string())),
+            ]),
+        ];
+        pool.append_rows(table.clone(), None, &rows, None, None)
+            .await?;
+
+        assert_eq!(
+            pool.values(&format!("SELECT id FROM {table} ORDER BY id"))
+                .await?,
+            vec![Value::Int(1), Value::Int(2)]
+        );
+        pool.execute(&format!("DROP TABLE {table}"), None).await?;
+        pool.close().await?;
+        control.disconnect().await
+    }
 }
 
 #[cfg(feature = "arrow")]
