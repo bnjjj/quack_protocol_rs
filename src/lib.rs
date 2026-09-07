@@ -4,6 +4,8 @@
 //! `BinarySerializer`-compatible message, logical type, and `DataChunk` codecs
 //! needed by a Quack client.
 
+#[cfg(feature = "arrow")]
+pub mod arrow;
 mod binary;
 mod builders;
 mod client;

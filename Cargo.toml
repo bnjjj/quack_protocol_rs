@@ -10,7 +10,13 @@ documentation = "https://docs.rs/quack_protocol"
 keywords = ["duckdb", "quack", "database", "client"]
 categories = ["api-bindings", "database"]
 
+[features]
+arrow = ["dep:arrow-array", "dep:arrow-schema", "dep:arrow-buffer"]
+
 [dependencies]
+arrow-array = { version = "58", optional = true, default-features = false }
+arrow-buffer = { version = "58", optional = true, default-features = false }
+arrow-schema = { version = "58", optional = true, default-features = false }
 async-stream = "0.3"
 base64 = "0.22"
 futures-core = "0.3"

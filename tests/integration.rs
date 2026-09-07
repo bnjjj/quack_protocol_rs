@@ -680,3 +680,476 @@ async fn live_quack_surfaces_server_errors() -> Result<()> {
     client.disconnect().await?;
     Ok(())
 }
+
+#[cfg(feature = "arrow")]
+mod arrow_output {
+    use std::sync::Arc;
+
+    use futures_util::TryStreamExt;
+    use quack_protocol::arrow::arrow_array::cast::AsArray;
+    use quack_protocol::arrow::arrow_array::types::Int32Type;
+    use quack_protocol::arrow::arrow_array::{
+        Array, BinaryArray, BooleanArray, Date32Array, Decimal128Array, Decimal256Array,
+        FixedSizeListArray, Float32Array, Float64Array, Int8Array, Int16Array, Int32Array,
+        Int64Array, IntervalMonthDayNanoArray, ListArray, RecordBatch, StringArray, StructArray,
+        Time64MicrosecondArray, Time64NanosecondArray, TimestampMicrosecondArray,
+        TimestampMillisecondArray, TimestampNanosecondArray, TimestampSecondArray, UInt8Array,
+        UInt16Array, UInt32Array, UInt64Array,
+    };
+    use quack_protocol::arrow::arrow_buffer::{IntervalMonthDayNano, i256};
+    use quack_protocol::arrow::arrow_schema::{DataType, Field, IntervalUnit, TimeUnit};
+    use quack_protocol::{QuackError, Result};
+
+    use super::{live_client, unique_name};
+
+    fn column_as<'a, T: Array + 'static>(batch: &'a RecordBatch, name: &str) -> &'a T {
+        batch
+            .column_by_name(name)
+            .unwrap_or_else(|| panic!("missing column {name}"))
+            .as_any()
+            .downcast_ref::<T>()
+            .unwrap_or_else(|| panic!("column {name} has an unexpected Arrow type"))
+    }
+
+    #[tokio::test]
+    async fn live_quack_arrow_round_trips_scalar_types() -> Result<()> {
+        let Some(client) = live_client().await? else {
+            return Ok(());
+        };
+        let enum_name = unique_name("quack_rust_arrow_mood");
+        let (_, batches) = client
+            .query(
+                &format!("CREATE TYPE {enum_name} AS ENUM ('sad', 'ok', 'happy')"),
+                None,
+            )
+            .await?
+            .into_record_batches()?;
+        let _: Vec<RecordBatch> = batches.try_collect().await?;
+
+        let (schema, batches) = client
+            .query(
+                &format!(
+                    "
+            SELECT
+              -- The server binds an untyped NULL literal to INTEGER.
+              NULL AS null_v,
+              TRUE AS bool_v,
+              127::TINYINT AS tiny_v,
+              32767::SMALLINT AS small_v,
+              2147483647::INTEGER AS int_v,
+              9007199254740993::BIGINT AS big_v,
+              255::UTINYINT AS utiny_v,
+              65535::USMALLINT AS usmall_v,
+              4294967295::UINTEGER AS uint_v,
+              18446744073709551615::UBIGINT AS ubig_v,
+              123456789012345678901234567890::HUGEINT AS huge_v,
+              123456789012345678901234567890::UHUGEINT AS uhuge_v,
+              1.5::FLOAT AS float_v,
+              2.25::DOUBLE AS double_v,
+              12.34::DECIMAL(4, 2) AS dec16_v,
+              1234567.89::DECIMAL(9, 2) AS dec32_v,
+              1234567890123456.78::DECIMAL(18, 2) AS dec64_v,
+              123456789012345678901234567890.1234::DECIMAL(38, 4) AS dec128_v,
+              'hello'::VARCHAR AS string_v,
+              'hi'::BLOB AS blob_v,
+              '5b1c9df8-4d0f-4c1e-9a2b-3c4d5e6f7a8b'::UUID AS uuid_v,
+              DATE '2020-01-02' AS date_v,
+              '00:00:01.234567'::TIME AS time_v,
+              '00:00:01.234567890'::TIME_NS AS time_ns_v,
+              TIMESTAMP '1970-01-01 00:00:01.234567' AS ts_v,
+              '1970-01-01 00:00:01'::TIMESTAMP_S AS ts_s_v,
+              '1970-01-01 00:00:01.234'::TIMESTAMP_MS AS ts_ms_v,
+              '1970-01-01 00:00:01.234567890'::TIMESTAMP_NS AS ts_ns_v,
+              TIMESTAMPTZ '1970-01-01 00:00:01.234567+00' AS ts_tz_v,
+              INTERVAL '1 month 2 days 3 microseconds' AS interval_v,
+              'ok'::{enum_name} AS enum_v
+            "
+                ),
+                None,
+            )
+            .await?
+            .into_record_batches()?;
+        let batches: Vec<RecordBatch> = batches.try_collect().await?;
+
+        assert_eq!(
+            schema
+                .fields()
+                .iter()
+                .map(|field| field.data_type().clone())
+                .collect::<Vec<_>>(),
+            vec![
+                DataType::Int32,
+                DataType::Boolean,
+                DataType::Int8,
+                DataType::Int16,
+                DataType::Int32,
+                DataType::Int64,
+                DataType::UInt8,
+                DataType::UInt16,
+                DataType::UInt32,
+                DataType::UInt64,
+                DataType::Decimal256(39, 0),
+                DataType::Decimal256(39, 0),
+                DataType::Float32,
+                DataType::Float64,
+                DataType::Decimal128(4, 2),
+                DataType::Decimal128(9, 2),
+                DataType::Decimal128(18, 2),
+                DataType::Decimal128(38, 4),
+                DataType::Utf8,
+                DataType::Binary,
+                DataType::Utf8,
+                DataType::Date32,
+                DataType::Time64(TimeUnit::Microsecond),
+                DataType::Time64(TimeUnit::Nanosecond),
+                DataType::Timestamp(TimeUnit::Microsecond, None),
+                DataType::Timestamp(TimeUnit::Second, None),
+                DataType::Timestamp(TimeUnit::Millisecond, None),
+                DataType::Timestamp(TimeUnit::Nanosecond, None),
+                DataType::Timestamp(TimeUnit::Microsecond, Some("UTC".into())),
+                DataType::Interval(IntervalUnit::MonthDayNano),
+                DataType::Utf8,
+            ]
+        );
+        assert!(schema.fields().iter().all(|field| field.is_nullable()));
+
+        assert_eq!(batches.len(), 1);
+        let batch = &batches[0];
+        assert_eq!(batch.num_rows(), 1);
+        assert_eq!(batch.schema(), schema);
+        assert_eq!(batch.column_by_name("null_v").unwrap().null_count(), 1);
+        assert!(column_as::<BooleanArray>(batch, "bool_v").value(0));
+        assert_eq!(column_as::<Int8Array>(batch, "tiny_v").value(0), 127);
+        assert_eq!(column_as::<Int16Array>(batch, "small_v").value(0), 32767);
+        assert_eq!(column_as::<Int32Array>(batch, "int_v").value(0), 2147483647);
+        assert_eq!(
+            column_as::<Int64Array>(batch, "big_v").value(0),
+            9007199254740993
+        );
+        assert_eq!(column_as::<UInt8Array>(batch, "utiny_v").value(0), 255);
+        assert_eq!(column_as::<UInt16Array>(batch, "usmall_v").value(0), 65535);
+        assert_eq!(
+            column_as::<UInt32Array>(batch, "uint_v").value(0),
+            4294967295
+        );
+        assert_eq!(column_as::<UInt64Array>(batch, "ubig_v").value(0), u64::MAX);
+        assert_eq!(
+            column_as::<Decimal256Array>(batch, "huge_v").value(0),
+            i256::from_i128(123456789012345678901234567890)
+        );
+        assert_eq!(
+            column_as::<Decimal256Array>(batch, "uhuge_v").value(0),
+            i256::from_i128(123456789012345678901234567890)
+        );
+        assert_eq!(column_as::<Float32Array>(batch, "float_v").value(0), 1.5);
+        assert_eq!(column_as::<Float64Array>(batch, "double_v").value(0), 2.25);
+        assert_eq!(
+            column_as::<Decimal128Array>(batch, "dec16_v").value(0),
+            1234
+        );
+        assert_eq!(
+            column_as::<Decimal128Array>(batch, "dec32_v").value(0),
+            123456789
+        );
+        assert_eq!(
+            column_as::<Decimal128Array>(batch, "dec64_v").value(0),
+            123456789012345678
+        );
+        assert_eq!(
+            column_as::<Decimal128Array>(batch, "dec128_v").value(0),
+            1234567890123456789012345678901234
+        );
+        assert_eq!(
+            column_as::<StringArray>(batch, "string_v").value(0),
+            "hello"
+        );
+        assert_eq!(column_as::<BinaryArray>(batch, "blob_v").value(0), b"hi");
+        assert_eq!(
+            column_as::<StringArray>(batch, "uuid_v").value(0),
+            "5b1c9df8-4d0f-4c1e-9a2b-3c4d5e6f7a8b"
+        );
+        assert_eq!(column_as::<Date32Array>(batch, "date_v").value(0), 18263);
+        assert_eq!(
+            column_as::<Time64MicrosecondArray>(batch, "time_v").value(0),
+            1_234_567
+        );
+        assert_eq!(
+            column_as::<Time64NanosecondArray>(batch, "time_ns_v").value(0),
+            1_234_567_890
+        );
+        assert_eq!(
+            column_as::<TimestampMicrosecondArray>(batch, "ts_v").value(0),
+            1_234_567
+        );
+        assert_eq!(
+            column_as::<TimestampSecondArray>(batch, "ts_s_v").value(0),
+            1
+        );
+        assert_eq!(
+            column_as::<TimestampMillisecondArray>(batch, "ts_ms_v").value(0),
+            1_234
+        );
+        assert_eq!(
+            column_as::<TimestampNanosecondArray>(batch, "ts_ns_v").value(0),
+            1_234_567_890
+        );
+        assert_eq!(
+            column_as::<TimestampMicrosecondArray>(batch, "ts_tz_v").value(0),
+            1_234_567
+        );
+        assert_eq!(
+            column_as::<IntervalMonthDayNanoArray>(batch, "interval_v").value(0),
+            IntervalMonthDayNano::new(1, 2, 3_000)
+        );
+        assert_eq!(column_as::<StringArray>(batch, "enum_v").value(0), "ok");
+
+        client.disconnect().await?;
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn live_quack_arrow_round_trips_nested_types() -> Result<()> {
+        let Some(client) = live_client().await? else {
+            return Ok(());
+        };
+
+        let (schema, batches) = client
+            .query(
+                "
+            SELECT
+              [1, NULL, 3]::INTEGER[] AS ints,
+              [[1, 2], [3, 4]]::INTEGER[][] AS nested_ints,
+              {'x': 1::INTEGER, 'y': 'one'::VARCHAR} AS point,
+              [{'x': 5::INTEGER, 'y': 'five'::VARCHAR}, NULL] AS points,
+              map(['a', 'b'], [1, 2]) AS map_v,
+              array_value(7, 8, 9)::INTEGER[3] AS fixed_v
+            ",
+                None,
+            )
+            .await?
+            .into_record_batches()?;
+        let batches: Vec<RecordBatch> = batches.try_collect().await?;
+        let batch = &batches[0];
+
+        let point_fields = vec![
+            Field::new("x", DataType::Int32, true),
+            Field::new("y", DataType::Utf8, true),
+        ];
+        assert_eq!(
+            schema
+                .fields()
+                .iter()
+                .map(|field| field.data_type().clone())
+                .collect::<Vec<_>>(),
+            vec![
+                DataType::List(Arc::new(Field::new("item", DataType::Int32, true))),
+                DataType::List(Arc::new(Field::new(
+                    "item",
+                    DataType::List(Arc::new(Field::new("item", DataType::Int32, true))),
+                    true
+                ))),
+                DataType::Struct(point_fields.clone().into()),
+                DataType::List(Arc::new(Field::new(
+                    "item",
+                    DataType::Struct(point_fields.clone().into()),
+                    true
+                ))),
+                DataType::List(Arc::new(Field::new(
+                    "item",
+                    DataType::Struct(
+                        vec![
+                            Field::new("key", DataType::Utf8, true),
+                            Field::new("value", DataType::Int32, true),
+                        ]
+                        .into()
+                    ),
+                    true
+                ))),
+                DataType::FixedSizeList(Arc::new(Field::new("item", DataType::Int32, true)), 3),
+            ]
+        );
+
+        let ints = column_as::<ListArray>(batch, "ints").value(0);
+        assert_eq!(
+            ints.as_primitive::<Int32Type>(),
+            &Int32Array::from(vec![Some(1), None, Some(3)])
+        );
+
+        let nested = column_as::<ListArray>(batch, "nested_ints").value(0);
+        let nested = nested.as_list::<i32>();
+        assert_eq!(nested.len(), 2);
+        assert_eq!(
+            nested.value(1).as_primitive::<Int32Type>(),
+            &Int32Array::from(vec![3, 4])
+        );
+
+        let point = column_as::<StructArray>(batch, "point");
+        assert_eq!(
+            point.column(0).as_primitive::<Int32Type>(),
+            &Int32Array::from(vec![1])
+        );
+        assert_eq!(
+            point.column(1).as_string::<i32>(),
+            &StringArray::from(vec!["one"])
+        );
+
+        let points = column_as::<ListArray>(batch, "points").value(0);
+        let points = points.as_struct();
+        assert_eq!(points.len(), 2);
+        assert!(points.is_null(1));
+        assert_eq!(
+            points.column(1).as_string::<i32>(),
+            &StringArray::from(vec![Some("five"), None])
+        );
+
+        let entries = column_as::<ListArray>(batch, "map_v").value(0);
+        let entries = entries.as_struct();
+        assert_eq!(
+            entries.column(0).as_string::<i32>(),
+            &StringArray::from(vec!["a", "b"])
+        );
+        assert_eq!(
+            entries.column(1).as_primitive::<Int32Type>(),
+            &Int32Array::from(vec![1, 2])
+        );
+
+        let fixed = column_as::<FixedSizeListArray>(batch, "fixed_v").value(0);
+        assert_eq!(
+            fixed.as_primitive::<Int32Type>(),
+            &Int32Array::from(vec![7, 8, 9])
+        );
+
+        client.disconnect().await?;
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn live_quack_arrow_preserves_empty_result_schema() -> Result<()> {
+        let Some(client) = live_client().await? else {
+            return Ok(());
+        };
+
+        let (schema, batches) = client
+            .query(
+                "SELECT 1::INTEGER AS id, 'x'::VARCHAR AS label WHERE 1 = 0",
+                None,
+            )
+            .await?
+            .into_record_batches()?;
+        let batches: Vec<RecordBatch> = batches.try_collect().await?;
+
+        assert_eq!(
+            schema
+                .fields()
+                .iter()
+                .map(|field| (field.name().clone(), field.data_type().clone()))
+                .collect::<Vec<_>>(),
+            vec![
+                ("id".to_string(), DataType::Int32),
+                ("label".to_string(), DataType::Utf8),
+            ]
+        );
+        assert_eq!(batches.iter().map(RecordBatch::num_rows).sum::<usize>(), 0);
+
+        client.disconnect().await?;
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn live_quack_arrow_streams_multiple_batches_with_one_schema() -> Result<()> {
+        let Some(client) = live_client().await? else {
+            return Ok(());
+        };
+
+        let (schema, batches) = client
+            .query("SELECT i FROM range(5000) t(i) ORDER BY i", None)
+            .await?
+            .into_record_batches()?;
+        let batches: Vec<RecordBatch> = batches.try_collect().await?;
+
+        assert!(batches.len() > 1, "expected a multi-chunk result");
+        assert!(
+            batches
+                .iter()
+                .all(|batch| Arc::ptr_eq(&batch.schema(), &schema))
+        );
+        let values: Vec<i64> = batches
+            .iter()
+            .flat_map(|batch| {
+                column_as::<Int64Array>(batch, schema.field(0).name())
+                    .values()
+                    .to_vec()
+            })
+            .collect();
+        assert_eq!(values.len(), 5000);
+        assert_eq!(values.first(), Some(&0));
+        assert_eq!(values.last(), Some(&4999));
+
+        client.disconnect().await?;
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn live_quack_arrow_passes_variant_through_as_a_struct() -> Result<()> {
+        let Some(client) = live_client().await? else {
+            return Ok(());
+        };
+
+        let (schema, batches) = client
+            .query("SELECT {'x': 1, 'y': 'two'}::VARIANT AS variant_v", None)
+            .await?
+            .into_record_batches()?;
+        let batches: Vec<RecordBatch> = batches.try_collect().await?;
+
+        // VARIANT arrives as the struct DuckDB shreds it into, the same shape
+        // the Value path already exposes.
+        let DataType::Struct(fields) = schema.field(0).data_type() else {
+            panic!("VARIANT should map to a struct, got {:?}", schema.field(0));
+        };
+        assert_eq!(
+            fields.iter().map(|field| field.name()).collect::<Vec<_>>(),
+            ["keys", "children", "values", "data"]
+        );
+
+        let column = batches[0].column(0).as_struct();
+        let keys = column.column_by_name("keys").unwrap().as_list::<i32>();
+        assert_eq!(
+            keys.value(0).as_string::<i32>(),
+            &StringArray::from(vec!["x", "y"])
+        );
+        assert!(
+            !column
+                .column_by_name("data")
+                .unwrap()
+                .as_binary::<i32>()
+                .value(0)
+                .is_empty(),
+            "the variant payload should carry its encoded data"
+        );
+
+        client.disconnect().await?;
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn live_quack_arrow_rejects_unsupported_types() -> Result<()> {
+        let Some(client) = live_client().await? else {
+            return Ok(());
+        };
+
+        let error = client
+            .query("SELECT '12:34:56+02'::TIMETZ AS time_tz_v", None)
+            .await?
+            .into_record_batches()
+            .err()
+            .expect("TIMETZ has no Arrow mapping");
+
+        assert!(
+            matches!(&error, QuackError::UnsupportedType(message) if message.contains("TimeTz")),
+            "unexpected error: {error}"
+        );
+
+        client.disconnect().await?;
+        Ok(())
+    }
+}

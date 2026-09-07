@@ -857,6 +857,15 @@ pub(crate) fn get_array_size(logical_type: &LogicalType) -> Result<u64> {
     }
 }
 
+pub(crate) fn get_decimal_width_and_scale(logical_type: &LogicalType) -> Result<(u64, u64)> {
+    match logical_type.type_info.as_ref() {
+        Some(ExtraTypeInfo::Decimal { width, scale, .. }) => Ok((*width, *scale)),
+        _ => Err(QuackError::protocol(
+            "DECIMAL type is missing DecimalTypeInfo",
+        )),
+    }
+}
+
 pub(crate) fn get_enum_values(logical_type: &LogicalType) -> Result<&[String]> {
     match logical_type.type_info.as_ref() {
         Some(ExtraTypeInfo::Enum { values, .. }) => Ok(values),
@@ -915,14 +924,7 @@ fn decode_coordinate_reference_system(
 }
 
 fn decimal_physical_type(logical_type: &LogicalType) -> Result<PhysicalType> {
-    let width = match logical_type.type_info.as_ref() {
-        Some(ExtraTypeInfo::Decimal { width, .. }) => *width,
-        _ => {
-            return Err(QuackError::protocol(
-                "DECIMAL type is missing DecimalTypeInfo",
-            ));
-        }
-    };
+    let (width, _) = get_decimal_width_and_scale(logical_type)?;
     Ok(if width <= 4 {
         PhysicalType::Int16
     } else if width <= 9 {

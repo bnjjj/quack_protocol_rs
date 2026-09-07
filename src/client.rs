@@ -78,7 +78,7 @@ pub struct QueryMetadata {
     pub query_id: Option<String>,
 }
 
-#[must_use = "call into_rows() or into_chunks() to consume the query results"]
+#[must_use = "query results are dropped unless the stream is consumed"]
 pub struct QuackResultStream {
     columns: Vec<ColumnDefinition>,
     inner: BoxStream<'static, Result<DataChunk>>,
