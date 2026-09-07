@@ -1,6 +1,6 @@
 use std::iter::zip;
-use std::sync::Arc;
-use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
+use std::sync::atomic::{AtomicU64, Ordering};
+use std::sync::{Arc, Mutex as StdMutex};
 use std::time::{Duration, Instant};
 
 use async_stream::try_stream;
@@ -11,9 +11,16 @@ use tokio::sync::{Mutex, OwnedMutexGuard};
 
 use crate::binary::HugeIntParts;
 use crate::builders::{ColumnDefinition, data_chunk_from_rows};
-use crate::constants::{DEFAULT_QUACK_PORT, DUCKDB_MIME_TYPE, QUACK_ENDPOINT, QUACK_VERSION};
+use crate::constants::{
+    DEFAULT_HEARTBEAT_TIMEOUT_SECS, DEFAULT_QUACK_PORT, DUCKDB_MIME_TYPE,
+    MAX_HEARTBEAT_TIMEOUT_SECS, MAX_QUACK_VERSION, MIN_QUACK_VERSION, QUACK_ENDPOINT, QUACK_V1,
+    QUACK_V3,
+};
 use crate::errors::{QuackError, Result};
-use crate::messages::{MessageHeader, MessageType, QuackMessage, decode_message, encode_message};
+use crate::messages::{
+    MessageHeader, MessageType, QuackMessage, decode_message_for_version,
+    encode_message_for_version,
+};
 use crate::sql::{QuerySql, SqlParameters, format_sql};
 use crate::vector::{DataChunk, Row, Value, rows_from_chunk_with_names};
 
@@ -35,6 +42,8 @@ pub struct QuackClientOptions {
     pub client_platform: Option<String>,
     pub min_supported_quack_version: Option<u64>,
     pub max_supported_quack_version: Option<u64>,
+    pub client_id: Option<String>,
+    pub heartbeat_timeout: Option<Duration>,
     pub ssl: Option<bool>,
     pub timeout: Option<Duration>,
     pub headers: HeaderMap,
@@ -48,6 +57,8 @@ impl Default for QuackClientOptions {
             client_platform: None,
             min_supported_quack_version: None,
             max_supported_quack_version: None,
+            client_id: None,
+            heartbeat_timeout: Some(Duration::from_secs(DEFAULT_HEARTBEAT_TIMEOUT_SECS)),
             ssl: None,
             timeout: Some(DEFAULT_QUACK_REQUEST_TIMEOUT),
             headers: HeaderMap::new(),
@@ -60,6 +71,7 @@ pub struct QuackConnectionInfo {
     pub server_duckdb_version: Option<String>,
     pub server_platform: Option<String>,
     pub quack_version: Option<u64>,
+    pub heartbeat_timeout: Option<Duration>,
 }
 
 pub struct QueryMetadata {
@@ -108,6 +120,8 @@ struct FetchState {
     needs_more_fetch: bool,
     query_started: Instant,
     rows_delivered: usize,
+    next_batch_index: u64,
+    ack_index: u64,
 }
 
 #[derive(Clone, Debug)]
@@ -128,6 +142,8 @@ pub struct QuackClient {
     // TODO: close message is not issued to Quack server when `Connection` is
     // dropped. Server retains the cursor for the dropped connection_id.
     connection: Arc<Mutex<Connection>>,
+    state: Arc<ConnectionState>,
+    _heartbeat: Option<Arc<HeartbeatGuard>>,
     pub info: Option<QuackConnectionInfo>,
 }
 
@@ -142,20 +158,21 @@ impl QuackClient {
             .build()?;
         let base_url = parsed.base_url.trim_end_matches('/').to_string();
         let (connection, info) = Connection::connect(base_url, http, timeout, options).await?;
+        let state = Arc::clone(&connection.state);
+        let heartbeat = info
+            .heartbeat_timeout
+            .map(|timeout| Arc::new(HeartbeatGuard::start(&connection, timeout)));
 
         Ok(Self {
             connection: Arc::new(Mutex::new(connection)),
+            state,
+            _heartbeat: heartbeat,
             info: Some(info),
         })
     }
 
     pub fn is_connected(&self) -> bool {
-        match self.connection.try_lock() {
-            Ok(guard) => !guard.closed.load(Ordering::Relaxed),
-            // Something's actively using the connection, so it can't be closed yet -
-            // closing requires this same lock.
-            Err(_) => true,
-        }
+        !self.state.is_closed()
     }
 
     pub async fn execute(&self, sql: &str, metadata: Option<&QueryMetadata>) -> Result<()> {
@@ -258,6 +275,8 @@ impl QuackClient {
             needs_more_fetch,
             query_started,
             rows_delivered: rows,
+            next_batch_index: 1,
+            ack_index: 0,
         };
         Ok((columns, chunks, fetch_state))
     }
@@ -275,22 +294,70 @@ impl QuackClient {
             mut needs_more_fetch,
             query_started,
             mut rows_delivered,
+            mut next_batch_index,
+            mut ack_index,
         } = state;
         let column_names = columns
             .iter()
             .map(|col| col.name.to_owned())
             .collect::<Vec<_>>();
+        let quack_version = connection.quack_version;
 
         Box::pin(try_stream! {
             while needs_more_fetch {
                 let fetch_started = Instant::now();
-                let mut results = match connection.fetch(result_uuid).await? {
-                    QuackMessage::FetchResponse { results, .. } => results,
+                let (mut results, total_batches, batch_index) = match connection
+                    .fetch(result_uuid, next_batch_index, ack_index)
+                    .await?
+                {
+                    QuackMessage::FetchResponse {
+                        results,
+                        total_batches,
+                        batch_index,
+                        ..
+                    } => (results, total_batches, batch_index),
                     other => Err(QuackError::protocol(format!(
                         "expected FETCH_RESPONSE, got {:?}",
                         other.message_type()
                     )))?,
                 };
+
+                if quack_version == QUACK_V3 {
+                    match batch_index {
+                        Some(batch_index) if batch_index == next_batch_index => {
+                            if results.is_empty() {
+                                Err(QuackError::protocol(
+                                    "FETCH_RESPONSE batch did not include any chunks",
+                                ))?;
+                            }
+                            ack_index = batch_index;
+                            next_batch_index = next_batch_index.checked_add(1).ok_or_else(|| {
+                                QuackError::protocol("FETCH_RESPONSE batch index overflow")
+                            })?;
+                        }
+                        // A v3 FETCH_REQUEST asks for one exact batch. The server may produce
+                        // batches out of order internally, but it must answer with the requested
+                        // index; accepting another index here would silently reorder the result.
+                        Some(batch_index) => Err(QuackError::protocol(format!(
+                            "expected FETCH_RESPONSE batch {next_batch_index}, got {batch_index}"
+                        )))?,
+                        None if results.is_empty() => {
+                            if let Some(total_batches) = total_batches {
+                                if total_batches != ack_index {
+                                    Err(QuackError::protocol(format!(
+                                        "FETCH_RESPONSE ended after {ack_index} batches but announced {total_batches}"
+                                    )))?;
+                                }
+                            }
+                        }
+                        None => Err(QuackError::protocol(
+                            "FETCH_RESPONSE with chunks did not include a batch index",
+                        ))?,
+                    }
+                    needs_more_fetch = batch_index.is_some();
+                } else {
+                    needs_more_fetch = !results.is_empty();
+                }
 
                 let rows: usize = results.iter().map(|chunk| chunk.row_count).sum();
                 rows_delivered += rows;
@@ -303,7 +370,6 @@ impl QuackClient {
                     "quack FETCH completed"
                 );
 
-                needs_more_fetch = !results.is_empty();
                 attach_column_names(&mut results, &column_names);
                 for chunk in results {
                     yield chunk;
@@ -365,8 +431,9 @@ impl QuackClient {
         schema_name: Option<String>,
         chunk: DataChunk,
     ) -> Result<()> {
-        let connection = self.connection.lock().await;
-        connection
+        self.connection
+            .lock()
+            .await
             .append(table_name.into(), schema_name, chunk)
             .await
     }
@@ -409,13 +476,12 @@ impl QuackClient {
 
 #[derive(Debug)]
 struct Connection {
-    base_url: String,
-    http: reqwest::Client,
-    headers: HeaderMap,
-    timeout: Duration,
+    transport: Transport,
     connection_id: String,
+    quack_version: u64,
     query_counter: AtomicU64,
-    closed: AtomicBool,
+    query_uuid_counter: AtomicU64,
+    state: Arc<ConnectionState>,
 }
 
 impl Connection {
@@ -425,66 +491,237 @@ impl Connection {
         timeout: Duration,
         options: QuackClientOptions,
     ) -> Result<(Self, QuackConnectionInfo)> {
-        let connection = Self {
+        let min_version = options
+            .min_supported_quack_version
+            .unwrap_or(MIN_QUACK_VERSION);
+        let max_version = options
+            .max_supported_quack_version
+            .unwrap_or(MAX_QUACK_VERSION);
+        if min_version > max_version {
+            return Err(QuackError::protocol(format!(
+                "minimum Quack protocol version {min_version} exceeds maximum {max_version}"
+            )));
+        }
+        let versions = [QUACK_V3, QUACK_V1]
+            .into_iter()
+            .filter(|version| (min_version..=max_version).contains(version))
+            .collect::<Vec<_>>();
+        if versions.is_empty() {
+            return Err(QuackError::protocol(format!(
+                "supported Quack protocol versions are {QUACK_V1} and {QUACK_V3}, requested range was {min_version}..={max_version}"
+            )));
+        }
+
+        let heartbeat_timeout_seconds = options
+            .heartbeat_timeout
+            .unwrap_or_else(|| Duration::from_secs(DEFAULT_HEARTBEAT_TIMEOUT_SECS))
+            .as_secs();
+        if versions.contains(&QUACK_V3) {
+            validate_heartbeat_timeout(heartbeat_timeout_seconds)?;
+        }
+        let transport = Transport {
             base_url,
             http,
-            headers: options.headers,
+            headers: options.headers.clone(),
             timeout,
-            connection_id: String::new(),
-            query_counter: AtomicU64::new(1),
-            closed: AtomicBool::new(false),
         };
-        let response = connection
-            .send(&QuackMessage::ConnectionRequest {
-                header: MessageHeader::new(MessageType::ConnectionRequest),
-                auth_string: options.auth_token,
-                client_duckdb_version: options.client_duckdb_version,
-                client_platform: Some(
-                    options
-                        .client_platform
-                        .unwrap_or_else(|| "quack-rust".to_string()),
-                ),
-                min_supported_quack_version: options
-                    .min_supported_quack_version
-                    .unwrap_or(QUACK_VERSION),
-                max_supported_quack_version: options
-                    .max_supported_quack_version
-                    .unwrap_or(QUACK_VERSION),
-            })
-            .await?;
 
-        match response {
-            QuackMessage::ConnectionResponse {
-                header,
-                server_duckdb_version,
-                server_platform,
-                quack_version,
-            } => {
-                let connection_id = header.connection_id.ok_or_else(|| {
-                    QuackError::protocol("CONNECTION_RESPONSE did not include a connection id")
-                })?;
-                let info = QuackConnectionInfo {
+        let mut previous_error = None;
+        for (index, quack_version) in versions.iter().copied().enumerate() {
+            let response = transport
+                .send(
+                    &QuackMessage::ConnectionRequest {
+                        header: MessageHeader::new(MessageType::ConnectionRequest),
+                        auth_string: options.auth_token.clone(),
+                        client_duckdb_version: options.client_duckdb_version.clone(),
+                        client_platform: Some(
+                            options
+                                .client_platform
+                                .clone()
+                                .unwrap_or_else(|| "quack-rust".to_string()),
+                        ),
+                        min_supported_quack_version: quack_version,
+                        max_supported_quack_version: quack_version,
+                        client_id: options.client_id.clone(),
+                        heartbeat_timeout_seconds,
+                    },
+                    quack_version,
+                )
+                .await;
+
+            let response = match response {
+                Ok(response) => response,
+                Err(error)
+                    if index + 1 < versions.len()
+                        && quack_version == QUACK_V3
+                        && is_version_negotiation_error(&error) =>
+                {
+                    previous_error = Some(error);
+                    continue;
+                }
+                Err(error) if previous_error.is_some() && is_version_negotiation_error(&error) => {
+                    return Err(previous_error.expect("checked above"));
+                }
+                Err(error) => return Err(error),
+            };
+
+            match response {
+                QuackMessage::ConnectionResponse {
+                    header,
                     server_duckdb_version,
                     server_platform,
-                    quack_version,
-                };
-                Ok((
-                    Self {
-                        connection_id,
-                        ..connection
-                    },
-                    info,
-                ))
+                    quack_version: selected_version,
+                    heartbeat_timeout_seconds,
+                } => {
+                    let connection_id = header.connection_id.ok_or_else(|| {
+                        QuackError::protocol("CONNECTION_RESPONSE did not include a connection id")
+                    })?;
+                    if selected_version != Some(quack_version) {
+                        return Err(QuackError::protocol(format!(
+                            "server selected Quack protocol version {selected_version:?}, expected {quack_version}"
+                        )));
+                    }
+                    let heartbeat_timeout = if quack_version == QUACK_V3 {
+                        let seconds = heartbeat_timeout_seconds.ok_or_else(|| {
+                            QuackError::protocol(
+                                "protocol v3 CONNECTION_RESPONSE did not include a heartbeat timeout",
+                            )
+                        })?;
+                        validate_heartbeat_timeout(seconds)?;
+                        Some(Duration::from_secs(seconds))
+                    } else {
+                        None
+                    };
+                    let info = QuackConnectionInfo {
+                        server_duckdb_version,
+                        server_platform,
+                        quack_version: Some(quack_version),
+                        heartbeat_timeout,
+                    };
+                    return Ok((
+                        Self {
+                            transport,
+                            connection_id,
+                            quack_version,
+                            query_counter: AtomicU64::new(1),
+                            query_uuid_counter: AtomicU64::new(1),
+                            state: Arc::new(ConnectionState::new()),
+                        },
+                        info,
+                    ));
+                }
+                other => {
+                    return Err(QuackError::protocol(format!(
+                        "expected CONNECTION_RESPONSE, got {:?}",
+                        other.message_type()
+                    )));
+                }
             }
-            other => Err(QuackError::protocol(format!(
-                "expected CONNECTION_RESPONSE, got {:?}",
-                other.message_type()
-            ))),
         }
+
+        Err(previous_error.unwrap_or_else(|| {
+            QuackError::protocol("no compatible Quack protocol version was attempted")
+        }))
     }
 
     async fn send(&self, message: &QuackMessage) -> Result<QuackMessage> {
-        let bytes = encode_message(message)?;
+        let response = self.transport.send(message, self.quack_version).await?;
+        self.state.record_success();
+        Ok(response)
+    }
+
+    async fn prepare(&self, sql: &str) -> Result<QuackMessage> {
+        self.ensure_open()?;
+        let query_uuid = HugeIntParts {
+            upper: 0,
+            lower: self.query_uuid_counter.fetch_add(1, Ordering::Relaxed),
+        };
+        let message = QuackMessage::PrepareRequest {
+            header: self.scoped_header(MessageType::PrepareRequest),
+            sql: sql.to_string(),
+            query_uuid: (self.quack_version == QUACK_V3).then_some(query_uuid),
+            inline_rows: None,
+        };
+        self.send(&message).await
+    }
+
+    async fn fetch(
+        &self,
+        result_uuid: HugeIntParts,
+        batch_index: u64,
+        ack_index: u64,
+    ) -> Result<QuackMessage> {
+        self.ensure_open()?;
+        let message = QuackMessage::FetchRequest {
+            header: self.scoped_header(MessageType::FetchRequest),
+            result_uuid,
+            batch_index: (self.quack_version == QUACK_V3).then_some(batch_index),
+            ack_index: (self.quack_version == QUACK_V3).then_some(ack_index),
+        };
+        self.send(&message).await
+    }
+
+    async fn append(
+        &self,
+        table_name: String,
+        schema_name: Option<String>,
+        chunk: DataChunk,
+    ) -> Result<()> {
+        self.ensure_open()?;
+        if self.quack_version != QUACK_V1 {
+            return Err(QuackError::protocol(
+                "append is only supported by Quack protocol v1; protocol v3 uses SEND_DATA",
+            ));
+        }
+        let message = QuackMessage::AppendRequest {
+            header: self.scoped_header(MessageType::SendDataRequest),
+            schema_name,
+            table_name,
+            append_chunk: chunk,
+        };
+        expect_success(self.send(&message).await?)
+    }
+
+    async fn disconnect(&self) -> Result<()> {
+        if self.ensure_open().is_err() {
+            return Ok(());
+        }
+        let message = QuackMessage::Disconnect {
+            header: self.scoped_header(MessageType::DisconnectMessage),
+        };
+        let response = self.send(&message).await?;
+        expect_success(response)?;
+        self.state.close();
+        Ok(())
+    }
+
+    fn scoped_header(&self, message_type: MessageType) -> MessageHeader {
+        let query_id = self.query_counter.fetch_add(1, Ordering::Relaxed);
+        MessageHeader::new(message_type)
+            .with_connection(self.connection_id.clone())
+            .with_client_query_id(query_id)
+    }
+
+    fn ensure_open(&self) -> Result<()> {
+        if self.state.is_closed() {
+            Err(QuackError::protocol("Quack client is not connected"))
+        } else {
+            Ok(())
+        }
+    }
+}
+
+#[derive(Clone, Debug)]
+struct Transport {
+    base_url: String,
+    http: reqwest::Client,
+    headers: HeaderMap,
+    timeout: Duration,
+}
+
+impl Transport {
+    async fn send(&self, message: &QuackMessage, quack_version: u64) -> Result<QuackMessage> {
+        let bytes = encode_message_for_version(message, quack_version)?;
         let mut request = self
             .http
             .post(format!("{}{}", self.base_url, QUACK_ENDPOINT))
@@ -504,75 +741,157 @@ impl Connection {
             )));
         }
         let bytes = response.bytes().await?;
-        let decoded = decode_message(&bytes)?;
+        let decoded = decode_message_for_version(&bytes, quack_version)?;
         if let QuackMessage::ErrorResponse { message, .. } = decoded {
             return Err(QuackError::server(message));
         }
         Ok(decoded)
     }
+}
 
-    async fn prepare(&self, sql: &str) -> Result<QuackMessage> {
-        self.ensure_open()?;
-        let message = QuackMessage::PrepareRequest {
-            header: self.scoped_header(MessageType::PrepareRequest),
-            sql: sql.to_string(),
-        };
-        self.send(&message).await
+#[derive(Debug)]
+struct HeartbeatGuard {
+    task: tokio::task::JoinHandle<()>,
+}
+
+impl HeartbeatGuard {
+    fn start(connection: &Connection, heartbeat_timeout: Duration) -> Self {
+        let transport = connection.transport.clone();
+        let connection_id = connection.connection_id.clone();
+        let state = Arc::clone(&connection.state);
+        let interval = (heartbeat_timeout / 3).max(Duration::from_millis(100));
+        let task = tokio::spawn(async move {
+            loop {
+                tokio::time::sleep(interval).await;
+                if state.is_closed() {
+                    return;
+                }
+                let heartbeat = QuackMessage::HeartbeatRequest {
+                    header: MessageHeader::new(MessageType::HeartbeatRequest)
+                        .with_connection(connection_id.clone()),
+                };
+                match transport.send(&heartbeat, QUACK_V3).await {
+                    Ok(QuackMessage::SuccessResponse { .. }) => state.record_success(),
+                    Ok(other) => {
+                        tracing::warn!(
+                            response = ?other.message_type(),
+                            "Quack heartbeat returned an unexpected response; closing connection"
+                        );
+                        state.close();
+                        return;
+                    }
+                    Err(error) if state.close_if_expired(heartbeat_timeout) => {
+                        tracing::warn!(
+                            %error,
+                            timeout_seconds = heartbeat_timeout.as_secs(),
+                            "Quack heartbeat lease expired; closing connection"
+                        );
+                        return;
+                    }
+                    Err(error) => {
+                        tracing::debug!(
+                            %error,
+                            "Quack heartbeat failed transiently; retrying before lease expiry"
+                        );
+                    }
+                }
+            }
+        });
+        Self { task }
+    }
+}
+
+#[derive(Debug)]
+struct ConnectionState {
+    lease: StdMutex<ConnectionLease>,
+}
+
+#[derive(Debug)]
+struct ConnectionLease {
+    last_successful_activity: Instant,
+    closed: bool,
+}
+
+impl ConnectionState {
+    fn new() -> Self {
+        Self::new_at(Instant::now())
     }
 
-    async fn fetch(&self, result_uuid: HugeIntParts) -> Result<QuackMessage> {
-        self.ensure_open()?;
-        let message = QuackMessage::FetchRequest {
-            header: self.scoped_header(MessageType::FetchRequest),
-            result_uuid,
-        };
-        self.send(&message).await
-    }
-
-    async fn append(
-        &self,
-        table_name: String,
-        schema_name: Option<String>,
-        chunk: DataChunk,
-    ) -> Result<()> {
-        self.ensure_open()?;
-        let message = QuackMessage::AppendRequest {
-            header: self.scoped_header(MessageType::AppendRequest),
-            schema_name,
-            table_name,
-            append_chunk: chunk,
-        };
-        let response = self.send(&message).await?;
-        expect_success(response)
-    }
-
-    async fn disconnect(&self) -> Result<()> {
-        if self.ensure_open().is_err() {
-            return Ok(());
+    fn new_at(now: Instant) -> Self {
+        Self {
+            lease: StdMutex::new(ConnectionLease {
+                last_successful_activity: now,
+                closed: false,
+            }),
         }
-        let message = QuackMessage::Disconnect {
-            header: self.scoped_header(MessageType::DisconnectMessage),
-        };
-        let response = self.send(&message).await?;
-        expect_success(response)?;
-        self.closed.store(true, Ordering::Relaxed);
-        Ok(())
     }
 
-    fn scoped_header(&self, message_type: MessageType) -> MessageHeader {
-        let query_id = self.query_counter.fetch_add(1, Ordering::Relaxed);
-        MessageHeader::new(message_type)
-            .with_connection(self.connection_id.clone())
-            .with_client_query_id(query_id)
+    fn record_success(&self) {
+        self.record_success_at(Instant::now());
     }
 
-    fn ensure_open(&self) -> Result<()> {
-        if self.closed.load(Ordering::Relaxed) {
-            Err(QuackError::protocol("Quack client is not connected"))
-        } else {
-            Ok(())
+    fn record_success_at(&self, now: Instant) {
+        let mut lease = self.lease();
+        if !lease.closed {
+            lease.last_successful_activity = now;
         }
     }
+
+    fn close_if_expired(&self, timeout: Duration) -> bool {
+        self.close_if_expired_at(Instant::now(), timeout)
+    }
+
+    fn close_if_expired_at(&self, now: Instant, timeout: Duration) -> bool {
+        let mut lease = self.lease();
+        if lease.closed || now.saturating_duration_since(lease.last_successful_activity) >= timeout
+        {
+            lease.closed = true;
+        }
+        lease.closed
+    }
+
+    fn close(&self) {
+        self.lease().closed = true;
+    }
+
+    fn is_closed(&self) -> bool {
+        self.lease().closed
+    }
+
+    fn lease(&self) -> std::sync::MutexGuard<'_, ConnectionLease> {
+        self.lease
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+    }
+}
+
+impl Drop for HeartbeatGuard {
+    fn drop(&mut self) {
+        self.task.abort();
+    }
+}
+
+fn validate_heartbeat_timeout(seconds: u64) -> Result<()> {
+    if !(1..=MAX_HEARTBEAT_TIMEOUT_SECS).contains(&seconds) {
+        return Err(QuackError::protocol(format!(
+            "heartbeat timeout must be between 1 and {MAX_HEARTBEAT_TIMEOUT_SECS} seconds"
+        )));
+    }
+    Ok(())
+}
+
+pub(crate) fn is_version_negotiation_error(error: &QuackError) -> bool {
+    let message = match error {
+        QuackError::Protocol(message) | QuackError::Server(message) => message,
+        _ => return false,
+    };
+    let message = message.to_ascii_lowercase();
+    message.contains("quack version")
+        || message.contains("protocol version")
+        || message.contains("http request failed with 500")
+        || message.contains("deserialize")
+        || message.contains("end of object")
+        || message.contains("unexpected field")
 }
 
 pub(crate) fn parse_quack_uri(input: &str, ssl_override: Option<bool>) -> Result<ParsedQuackUri> {
@@ -698,5 +1017,27 @@ mod tests {
             QuackClientOptions::default().timeout,
             Some(DEFAULT_QUACK_REQUEST_TIMEOUT)
         );
+    }
+
+    #[test]
+    fn heartbeat_timeout_is_bounded() {
+        assert!(validate_heartbeat_timeout(1).is_ok());
+        assert!(validate_heartbeat_timeout(MAX_HEARTBEAT_TIMEOUT_SECS).is_ok());
+        assert!(validate_heartbeat_timeout(0).is_err());
+        assert!(validate_heartbeat_timeout(MAX_HEARTBEAT_TIMEOUT_SECS + 1).is_err());
+    }
+
+    #[test]
+    fn connection_state_expires_only_after_the_last_successful_activity() {
+        let started = Instant::now();
+        let timeout = Duration::from_secs(30);
+        let state = ConnectionState::new_at(started);
+
+        assert!(!state.close_if_expired_at(started + Duration::from_secs(29), timeout));
+
+        state.record_success_at(started + Duration::from_secs(29));
+        assert!(!state.close_if_expired_at(started + Duration::from_secs(58), timeout));
+        assert!(state.close_if_expired_at(started + Duration::from_secs(59), timeout));
+        assert!(state.is_closed());
     }
 }

@@ -730,7 +730,7 @@ dependencies = [
 
 [[package]]
 name = "quack_protocol"
-version = "0.2.22"
+version = "0.3.0-alpha.1"
 dependencies = [
  "arrow-array",
  "arrow-buffer",

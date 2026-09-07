@@ -51,6 +51,26 @@ fn assert_decimal(value: &Value, unscaled: i128, width: u64, scale: u64) {
 }
 
 #[tokio::test]
+async fn live_quack_reports_negotiated_version() -> Result<()> {
+    let Some(client) = live_client().await? else {
+        return Ok(());
+    };
+
+    let version = client
+        .info
+        .as_ref()
+        .and_then(|info| info.quack_version)
+        .expect("connected server should report its Quack protocol version");
+    assert!(matches!(version, 1 | 3));
+    if let Ok(expected) = std::env::var("QUACK_EXPECTED_VERSION") {
+        assert_eq!(version.to_string(), expected);
+    }
+
+    client.disconnect().await?;
+    Ok(())
+}
+
+#[tokio::test]
 async fn live_quack_basic_query_when_configured() -> Result<()> {
     let Some(client) = live_client().await? else {
         return Ok(());
