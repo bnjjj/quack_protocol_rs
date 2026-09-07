@@ -1,6 +1,6 @@
 use std::iter::zip;
-use std::sync::Arc;
-use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
+use std::sync::atomic::{AtomicU64, Ordering};
+use std::sync::{Arc, Mutex as StdMutex};
 use std::time::{Duration, Instant};
 
 use async_stream::try_stream;
@@ -142,6 +142,7 @@ pub struct QuackClient {
     // TODO: close message is not issued to Quack server when `Connection` is
     // dropped. Server retains the cursor for the dropped connection_id.
     connection: Arc<Mutex<Connection>>,
+    state: Arc<ConnectionState>,
     _heartbeat: Option<Arc<HeartbeatGuard>>,
     pub info: Option<QuackConnectionInfo>,
 }
@@ -157,24 +158,21 @@ impl QuackClient {
             .build()?;
         let base_url = parsed.base_url.trim_end_matches('/').to_string();
         let (connection, info) = Connection::connect(base_url, http, timeout, options).await?;
+        let state = Arc::clone(&connection.state);
         let heartbeat = info
             .heartbeat_timeout
             .map(|timeout| Arc::new(HeartbeatGuard::start(&connection, timeout)));
 
         Ok(Self {
             connection: Arc::new(Mutex::new(connection)),
+            state,
             _heartbeat: heartbeat,
             info: Some(info),
         })
     }
 
     pub fn is_connected(&self) -> bool {
-        match self.connection.try_lock() {
-            Ok(guard) => !guard.closed.load(Ordering::Relaxed),
-            // Something's actively using the connection, so it can't be closed yet -
-            // closing requires this same lock.
-            Err(_) => true,
-        }
+        !self.state.is_closed()
     }
 
     pub async fn execute(&self, sql: &str, metadata: Option<&QueryMetadata>) -> Result<()> {
@@ -337,6 +335,9 @@ impl QuackClient {
                                 QuackError::protocol("FETCH_RESPONSE batch index overflow")
                             })?;
                         }
+                        // A v3 FETCH_REQUEST asks for one exact batch. The server may produce
+                        // batches out of order internally, but it must answer with the requested
+                        // index; accepting another index here would silently reorder the result.
                         Some(batch_index) => Err(QuackError::protocol(format!(
                             "expected FETCH_RESPONSE batch {next_batch_index}, got {batch_index}"
                         )))?,
@@ -480,7 +481,7 @@ struct Connection {
     quack_version: u64,
     query_counter: AtomicU64,
     query_uuid_counter: AtomicU64,
-    closed: Arc<AtomicBool>,
+    state: Arc<ConnectionState>,
 }
 
 impl Connection {
@@ -604,7 +605,7 @@ impl Connection {
                             quack_version,
                             query_counter: AtomicU64::new(1),
                             query_uuid_counter: AtomicU64::new(1),
-                            closed: Arc::new(AtomicBool::new(false)),
+                            state: Arc::new(ConnectionState::new()),
                         },
                         info,
                     ));
@@ -624,7 +625,9 @@ impl Connection {
     }
 
     async fn send(&self, message: &QuackMessage) -> Result<QuackMessage> {
-        self.transport.send(message, self.quack_version).await
+        let response = self.transport.send(message, self.quack_version).await?;
+        self.state.record_success();
+        Ok(response)
     }
 
     async fn prepare(&self, sql: &str) -> Result<QuackMessage> {
@@ -688,7 +691,7 @@ impl Connection {
         };
         let response = self.send(&message).await?;
         expect_success(response)?;
-        self.closed.store(true, Ordering::Relaxed);
+        self.state.close();
         Ok(())
     }
 
@@ -700,7 +703,7 @@ impl Connection {
     }
 
     fn ensure_open(&self) -> Result<()> {
-        if self.closed.load(Ordering::Relaxed) {
+        if self.state.is_closed() {
             Err(QuackError::protocol("Quack client is not connected"))
         } else {
             Ok(())
@@ -755,22 +758,110 @@ impl HeartbeatGuard {
     fn start(connection: &Connection, heartbeat_timeout: Duration) -> Self {
         let transport = connection.transport.clone();
         let connection_id = connection.connection_id.clone();
-        let closed = Arc::clone(&connection.closed);
+        let state = Arc::clone(&connection.state);
         let interval = (heartbeat_timeout / 3).max(Duration::from_millis(100));
         let task = tokio::spawn(async move {
             loop {
                 tokio::time::sleep(interval).await;
-                if closed.load(Ordering::Relaxed) {
+                if state.is_closed() {
                     return;
                 }
                 let heartbeat = QuackMessage::HeartbeatRequest {
                     header: MessageHeader::new(MessageType::HeartbeatRequest)
                         .with_connection(connection_id.clone()),
                 };
-                let _ = transport.send(&heartbeat, QUACK_V3).await;
+                match transport.send(&heartbeat, QUACK_V3).await {
+                    Ok(QuackMessage::SuccessResponse { .. }) => state.record_success(),
+                    Ok(other) => {
+                        tracing::warn!(
+                            response = ?other.message_type(),
+                            "Quack heartbeat returned an unexpected response; closing connection"
+                        );
+                        state.close();
+                        return;
+                    }
+                    Err(error) if state.close_if_expired(heartbeat_timeout) => {
+                        tracing::warn!(
+                            %error,
+                            timeout_seconds = heartbeat_timeout.as_secs(),
+                            "Quack heartbeat lease expired; closing connection"
+                        );
+                        return;
+                    }
+                    Err(error) => {
+                        tracing::debug!(
+                            %error,
+                            "Quack heartbeat failed transiently; retrying before lease expiry"
+                        );
+                    }
+                }
             }
         });
         Self { task }
+    }
+}
+
+#[derive(Debug)]
+struct ConnectionState {
+    lease: StdMutex<ConnectionLease>,
+}
+
+#[derive(Debug)]
+struct ConnectionLease {
+    last_successful_activity: Instant,
+    closed: bool,
+}
+
+impl ConnectionState {
+    fn new() -> Self {
+        Self::new_at(Instant::now())
+    }
+
+    fn new_at(now: Instant) -> Self {
+        Self {
+            lease: StdMutex::new(ConnectionLease {
+                last_successful_activity: now,
+                closed: false,
+            }),
+        }
+    }
+
+    fn record_success(&self) {
+        self.record_success_at(Instant::now());
+    }
+
+    fn record_success_at(&self, now: Instant) {
+        let mut lease = self.lease();
+        if !lease.closed {
+            lease.last_successful_activity = now;
+        }
+    }
+
+    fn close_if_expired(&self, timeout: Duration) -> bool {
+        self.close_if_expired_at(Instant::now(), timeout)
+    }
+
+    fn close_if_expired_at(&self, now: Instant, timeout: Duration) -> bool {
+        let mut lease = self.lease();
+        if lease.closed || now.saturating_duration_since(lease.last_successful_activity) >= timeout
+        {
+            lease.closed = true;
+        }
+        lease.closed
+    }
+
+    fn close(&self) {
+        self.lease().closed = true;
+    }
+
+    fn is_closed(&self) -> bool {
+        self.lease().closed
+    }
+
+    fn lease(&self) -> std::sync::MutexGuard<'_, ConnectionLease> {
+        self.lease
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
     }
 }
 
@@ -926,5 +1017,27 @@ mod tests {
             QuackClientOptions::default().timeout,
             Some(DEFAULT_QUACK_REQUEST_TIMEOUT)
         );
+    }
+
+    #[test]
+    fn heartbeat_timeout_is_bounded() {
+        assert!(validate_heartbeat_timeout(1).is_ok());
+        assert!(validate_heartbeat_timeout(MAX_HEARTBEAT_TIMEOUT_SECS).is_ok());
+        assert!(validate_heartbeat_timeout(0).is_err());
+        assert!(validate_heartbeat_timeout(MAX_HEARTBEAT_TIMEOUT_SECS + 1).is_err());
+    }
+
+    #[test]
+    fn connection_state_expires_only_after_the_last_successful_activity() {
+        let started = Instant::now();
+        let timeout = Duration::from_secs(30);
+        let state = ConnectionState::new_at(started);
+
+        assert!(!state.close_if_expired_at(started + Duration::from_secs(29), timeout));
+
+        state.record_success_at(started + Duration::from_secs(29));
+        assert!(!state.close_if_expired_at(started + Duration::from_secs(58), timeout));
+        assert!(state.close_if_expired_at(started + Duration::from_secs(59), timeout));
+        assert!(state.is_closed());
     }
 }
