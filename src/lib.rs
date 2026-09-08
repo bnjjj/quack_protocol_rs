@@ -36,6 +36,9 @@ pub use logical_types::{
     ChildType, CoordinateReferenceSystem, ExtraTypeInfo, LogicalType, LogicalTypeId, LogicalTypes,
 };
 pub use pool::{DEFAULT_MAX_CONNECTIONS, PooledClient, QuackPool, QuackPoolOptions};
+/// HTTP header types for [`QuackClientOptions::headers`], so callers can set
+/// headers without depending on `reqwest` themselves.
+pub use reqwest::header::{HeaderMap, HeaderName, HeaderValue};
 pub use sql::{SqlParameter, SqlParameters, format_sql, sql_literal};
 pub use values::{
     date_from_iso_date, date_value, decimal_value, interval_value, time_tz_value, time_value,

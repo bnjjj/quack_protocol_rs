@@ -29,6 +29,8 @@ const DEFAULT_QUACK_CONNECT_TIMEOUT: Duration = Duration::from_secs(10);
 // A DISCONNECT sent from `Drop` runs detached, with no caller left to observe
 // it, so it is not given the full request timeout to hang around for.
 const DISCONNECT_ON_DROP_TIMEOUT: Duration = Duration::from_secs(10);
+// The column DuckDB uses to report how many rows a DML statement touched.
+const AFFECTED_ROWS_COLUMN: &str = "Count";
 
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub(crate) struct ParsedQuackUri {
@@ -38,8 +40,10 @@ pub(crate) struct ParsedQuackUri {
     pub(crate) ssl: bool,
 }
 
-#[derive(Clone, Debug)]
+#[derive(Clone)]
 pub struct QuackClientOptions {
+    /// Sent to the server on connect. Redacted by the `Debug` impl so the
+    /// options can be logged without leaking the credential.
     pub auth_token: Option<String>,
     pub client_duckdb_version: Option<String>,
     pub client_platform: Option<String>,
@@ -49,7 +53,35 @@ pub struct QuackClientOptions {
     pub heartbeat_timeout: Option<Duration>,
     pub ssl: Option<bool>,
     pub timeout: Option<Duration>,
+    /// Extra HTTP headers sent with every request. The header types are
+    /// re-exported at the crate root, so callers need not depend on `reqwest`.
     pub headers: HeaderMap,
+}
+
+impl std::fmt::Debug for QuackClientOptions {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("QuackClientOptions")
+            .field(
+                "auth_token",
+                &self.auth_token.as_ref().map(|_| "<redacted>"),
+            )
+            .field("client_duckdb_version", &self.client_duckdb_version)
+            .field("client_platform", &self.client_platform)
+            .field(
+                "min_supported_quack_version",
+                &self.min_supported_quack_version,
+            )
+            .field(
+                "max_supported_quack_version",
+                &self.max_supported_quack_version,
+            )
+            .field("client_id", &self.client_id)
+            .field("heartbeat_timeout", &self.heartbeat_timeout)
+            .field("ssl", &self.ssl)
+            .field("timeout", &self.timeout)
+            .field("headers", &self.headers)
+            .finish()
+    }
 }
 
 impl Default for QuackClientOptions {
@@ -120,9 +152,25 @@ impl QuackResultStream {
 
     // Consuming helpers shared by `QuackClient` and `QuackPool`; both drain the
     // stream, which releases the connection.
-    pub(crate) async fn drain(self) -> Result<()> {
-        let (_, chunks) = self.into_chunks();
-        chunks.try_for_each(|_| async { Ok(()) }).await
+    //
+    // DuckDB reports the rows a DML statement touched as a one-row, one-column
+    // result named `Count`; DDL and other statements report nothing. Anything
+    // else is a query, whose rows are not a count.
+    pub(crate) async fn affected_rows(self) -> Result<Option<u64>> {
+        let (columns, rows) = self.into_rows();
+        let rows: Vec<_> = rows.try_collect().await?;
+        let [column] = columns.as_slice() else {
+            return Ok(None);
+        };
+        if column.name != AFFECTED_ROWS_COLUMN || rows.len() != 1 {
+            return Ok(None);
+        }
+        Ok(match rows[0].get(AFFECTED_ROWS_COLUMN) {
+            Some(Value::Int(count)) => u64::try_from(*count).ok(),
+            Some(Value::UInt(count)) => Some(*count),
+            Some(Value::HugeInt(count)) => u64::try_from(*count).ok(),
+            _ => None,
+        })
     }
 
     pub(crate) async fn first_row(self) -> Result<Option<Row>> {
@@ -233,8 +281,19 @@ impl QuackClient {
         self.state.is_reusable()
     }
 
-    pub async fn execute(&self, sql: &str, metadata: Option<&QueryMetadata>) -> Result<()> {
-        self.query_inner(sql, None, metadata).await?.drain().await
+    /// Run a statement and discard its result.
+    ///
+    /// Returns the number of rows a DML statement touched, as DuckDB reports
+    /// it, and `None` for DDL and for queries.
+    pub async fn execute(
+        &self,
+        sql: &str,
+        metadata: Option<&QueryMetadata>,
+    ) -> Result<Option<u64>> {
+        self.query_inner(sql, None, metadata)
+            .await?
+            .affected_rows()
+            .await
     }
 
     pub async fn query(
@@ -1157,6 +1216,23 @@ mod tests {
             }
         }
         false
+    }
+
+    #[test]
+    fn debug_output_redacts_the_auth_token() {
+        let options = QuackClientOptions {
+            auth_token: Some("super_secret".to_string()),
+            client_id: Some("visible".to_string()),
+            ..Default::default()
+        };
+        let rendered = format!("{options:?}");
+        assert!(!rendered.contains("super_secret"), "{rendered}");
+        assert!(rendered.contains("<redacted>"), "{rendered}");
+        assert!(rendered.contains("visible"), "{rendered}");
+        assert!(
+            format!("{:?}", QuackClientOptions::default()).contains("auth_token: None"),
+            "an absent token is shown as absent"
+        );
     }
 
     #[test]

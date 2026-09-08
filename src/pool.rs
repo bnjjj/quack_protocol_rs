@@ -156,8 +156,16 @@ impl QuackPool {
         self.stream(sql, params, None).await
     }
 
-    pub async fn execute(&self, sql: &str, metadata: Option<&QueryMetadata>) -> Result<()> {
-        self.query(sql, metadata).await?.drain().await
+    /// Run a statement on any free connection and discard its result.
+    ///
+    /// Returns the number of rows a DML statement touched, as DuckDB reports
+    /// it, and `None` for DDL and for queries.
+    pub async fn execute(
+        &self,
+        sql: &str,
+        metadata: Option<&QueryMetadata>,
+    ) -> Result<Option<u64>> {
+        self.query(sql, metadata).await?.affected_rows().await
     }
 
     pub async fn first(&self, sql: &str) -> Result<Option<Row>> {

@@ -97,6 +97,12 @@ let ids = connection.values("SELECT id FROM staging").await?;
 // `connection` goes back to the pool when it is dropped.
 ```
 
+`execute()` returns the rows a DML statement touched, as DuckDB reports them,
+and `None` for DDL and queries. `QuackClientOptions` redacts `auth_token` in its
+`Debug` output, and the crate re-exports `HeaderMap`, `HeaderName`, and
+`HeaderValue` for `QuackClientOptions::headers` so callers need not depend on
+`reqwest`.
+
 A stream returned by `pool.query()` holds its connection until it is drained or
 dropped, so drop it when the results are no longer wanted rather than leaving it
 parked - the connection is not free until then.

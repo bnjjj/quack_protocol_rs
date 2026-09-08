@@ -697,7 +697,7 @@ mod connection_model {
     };
     use tokio::time::{sleep, timeout};
 
-    use super::{live_options, unique_name};
+    use super::{live_client, live_options, unique_name};
 
     // A server started by the tests is addressed by port, so each test picks
     // its own out of this block.
@@ -744,7 +744,8 @@ mod connection_model {
                 &format!("CALL quack_stop({})", quoted(&nested_uri(port))?),
                 None,
             )
-            .await
+            .await?;
+        Ok(())
     }
 
     async fn active_connections(control: &QuackClient, port: u16) -> Result<u64> {
@@ -1117,11 +1118,13 @@ mod connection_model {
         // An append lands in a table the whole server shares, so any session
         // can read it back - unlike a temp table.
         let table = unique_name("quack_rust_pool_append");
-        pool.execute(
-            &format!("CREATE TABLE {table} (id INTEGER, label VARCHAR)"),
-            None,
-        )
-        .await?;
+        let created = pool
+            .execute(
+                &format!("CREATE TABLE {table} (id INTEGER, label VARCHAR)"),
+                None,
+            )
+            .await?;
+        assert_eq!(created, None, "DDL reports no affected rows");
         let rows = vec![
             super::row(vec![
                 ("id", Value::Int(1)),
@@ -1143,6 +1146,52 @@ mod connection_model {
         pool.execute(&format!("DROP TABLE {table}"), None).await?;
         pool.close().await?;
         control.disconnect().await
+    }
+
+    #[tokio::test]
+    async fn live_quack_execute_reports_affected_rows() -> Result<()> {
+        let Some(client) = live_client().await? else {
+            return Ok(());
+        };
+        let table = unique_name("quack_rust_affected");
+
+        assert_eq!(
+            client
+                .execute(&format!("CREATE TEMP TABLE {table} (id INTEGER)"), None)
+                .await?,
+            None,
+            "DDL reports no affected rows"
+        );
+        assert_eq!(
+            client
+                .execute(&format!("INSERT INTO {table} VALUES (1), (2), (3)"), None)
+                .await?,
+            Some(3)
+        );
+        assert_eq!(
+            client
+                .execute(
+                    &format!("UPDATE {table} SET id = id + 1 WHERE id > 1"),
+                    None
+                )
+                .await?,
+            Some(2)
+        );
+        assert_eq!(
+            client
+                .execute(&format!("DELETE FROM {table} WHERE id > 100"), None)
+                .await?,
+            Some(0)
+        );
+        assert_eq!(
+            client
+                .execute(&format!("SELECT id FROM {table}"), None)
+                .await?,
+            None,
+            "a query's rows are not a count"
+        );
+
+        client.disconnect().await
     }
 }
 
