@@ -97,9 +97,10 @@ let ids = connection.values("SELECT id FROM staging").await?;
 // `connection` goes back to the pool when it is dropped.
 ```
 
-`execute()` returns the rows a DML statement touched, as DuckDB reports them,
-and `None` for DDL and queries. `QuackClientOptions` redacts `auth_token` in its
-`Debug` output, and the crate re-exports `HeaderMap`, `HeaderName`, and
+For a single `INSERT`, `UPDATE`, `DELETE`, or `MERGE`, `execute()` returns the
+rows DuckDB reports as touched. It returns `None` for DDL, queries, statements
+with `RETURNING`, and SQL batches. `QuackClientOptions` redacts `auth_token` in
+its `Debug` output, and the crate re-exports `HeaderMap`, `HeaderName`, and
 `HeaderValue` for `QuackClientOptions::headers` so callers need not depend on
 `reqwest`.
 
@@ -122,15 +123,16 @@ cursor for a connection id nobody can use again:
 ### When the server forgets a connection
 
 After a server restart, a session opened against the old server is gone and the
-server answers `Invalid connection id`. `QuackError::is_connection_lost()`
-reports that case; it means the request was rejected before any SQL ran.
+server answers `Invalid connection id`. Current Quack protocol versions carry
+only the error text, however, and SQL can raise exactly the same message after
+an earlier statement committed. The client therefore never retries a statement
+automatically.
 
-The pool handles this itself: it retires the stale connections and retries the
-query once on a fresh one. Only PREPARE is retried, because once results are
-streaming the statement has already run - errors from FETCH, and appends, are
-passed through untouched rather than risking a repeated write. A plain
-`QuackClient` does not reconnect; it is one session, and quietly opening another
-would drop the session state that came with it.
+The pool retires a session when the response exactly matches a known stale
+connection message, but returns the error to the caller. A later pool call opens
+a fresh session within `max_connections`. A plain `QuackClient` does not
+reconnect; it is one session, and quietly opening another would drop the session
+state that came with it.
 
 ## Arrow output
 

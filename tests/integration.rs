@@ -709,6 +709,8 @@ mod connection_model {
     const POOL_CLOSE_PORT: u16 = 19_606;
     const POOL_DROP_PORT: u16 = 19_607;
     const ABANDONED_STREAM_PORT: u16 = 19_608;
+    const RETRY_SAFETY_PORT: u16 = 19_609;
+    const LEASE_OWNERSHIP_PORT: u16 = 19_610;
 
     // Control connection to the configured server, used to start, stop, and
     // inspect the per-test server. `None` when no live server is configured.
@@ -983,10 +985,19 @@ mod connection_model {
         stop_server(&control, port).await?;
         start_server(&control, port).await?;
 
-        // The pool retires the stale connection and retries on a fresh one.
-        // PREPARE is rejected before any SQL runs, so the retry cannot repeat
-        // a statement.
+        // Error responses carry no typed cause, so the stale-session text is
+        // indistinguishable from SQL raising the same message. The pool must
+        // surface the first error rather than risk replaying a committed write.
+        let error = pool
+            .values("SELECT 2::INTEGER")
+            .await
+            .expect_err("a stale session should surface before replacement");
+        assert!(error.is_connection_fatal(), "{error}");
+
+        // The failed session was retired. A later, explicit call opens a fresh
+        // session and stays within the configured connection limit.
         assert_eq!(pool.values("SELECT 2::INTEGER").await?, vec![Value::Int(2)]);
+        assert_eq!(active_connections(&control, port).await?, 1);
 
         // A plain client does not reconnect: it is one session, and silently
         // opening another would drop the session state that came with it.
@@ -994,7 +1005,97 @@ mod connection_model {
             .values("SELECT 3::INTEGER")
             .await
             .expect_err("a stale session should surface");
-        assert!(error.is_connection_lost(), "{error}");
+        assert!(error.is_connection_fatal(), "{error}");
+
+        pool.close().await?;
+        stop_server(&control, port).await?;
+        control.disconnect().await
+    }
+
+    #[tokio::test]
+    async fn live_quack_pool_never_replays_ambiguous_server_error_text() -> Result<()> {
+        let Some(control) = control().await? else {
+            return Ok(());
+        };
+        let port = RETRY_SAFETY_PORT;
+        let uri = start_server(&control, port).await?;
+        let pool = QuackPool::connect(
+            &uri,
+            live_options(),
+            QuackPoolOptions { max_connections: 1 },
+        )
+        .await?;
+        let table = unique_name("quack_rust_no_replay");
+        pool.execute(&format!("CREATE TABLE {table} (id INTEGER)"), None)
+            .await?;
+
+        let error = pool
+            .execute(
+                &format!("INSERT INTO {table} VALUES (1); SELECT error('Invalid connection id')"),
+                None,
+            )
+            .await
+            .expect_err("the SQL error must be returned without replay");
+        assert!(
+            error.to_string().contains("Invalid connection id"),
+            "{error}"
+        );
+        assert_eq!(
+            pool.values(&format!("SELECT count(*)::BIGINT FROM {table}"))
+                .await?,
+            vec![Value::Int(1)],
+            "the committed INSERT must run exactly once"
+        );
+        assert_eq!(active_connections(&control, port).await?, 1);
+
+        pool.execute(&format!("DROP TABLE {table}"), None).await?;
+        pool.close().await?;
+        stop_server(&control, port).await?;
+        control.disconnect().await
+    }
+
+    #[tokio::test]
+    async fn live_quack_derived_handles_and_streams_retain_the_lease() -> Result<()> {
+        let Some(control) = control().await? else {
+            return Ok(());
+        };
+        let port = LEASE_OWNERSHIP_PORT;
+        let uri = start_server(&control, port).await?;
+        let pool = QuackPool::connect(
+            &uri,
+            live_options(),
+            QuackPoolOptions { max_connections: 1 },
+        )
+        .await?;
+
+        let lease = pool.acquire().await?;
+        let cloned_lease = lease.clone();
+        drop(lease);
+        assert!(
+            timeout(Duration::from_millis(250), pool.acquire())
+                .await
+                .is_err(),
+            "a cloned lease must keep the only permit"
+        );
+
+        let (_, stream) = cloned_lease
+            .query("SELECT i FROM range(100000) t(i)", None)
+            .await?
+            .into_chunks();
+        drop(cloned_lease);
+        assert!(
+            timeout(Duration::from_millis(250), pool.acquire())
+                .await
+                .is_err(),
+            "a stream derived from a lease must keep the only permit"
+        );
+        drop(stream);
+
+        let returned = timeout(Duration::from_secs(5), pool.acquire())
+            .await
+            .expect("dropping the last derived handle should release the lease")?;
+        drop(returned);
+        assert_eq!(active_connections(&control, port).await?, 1);
 
         pool.close().await?;
         stop_server(&control, port).await?;

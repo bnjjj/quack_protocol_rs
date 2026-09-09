@@ -1,13 +1,9 @@
 pub type Result<T> = std::result::Result<T, QuackError>;
 
-// Errors the Quack server reports when it no longer holds the session named by
-// our connection id - after a server restart, or once the session was
-// disconnected. The server rejects such a request before running any SQL, so a
-// caller may safely retry it on a fresh connection.
-//
-// The protocol carries no error code, only the extension's message text, so
-// these are matched as substrings and tracked against `duckdb-quack`.
-const CONNECTION_LOST_MESSAGES: [&str; 2] = [
+// The current protocol has no typed error code. Exact comparison keeps this
+// retirement heuristic narrower than arbitrary SQL error text containing one
+// of these server messages. It must never be used to authorize replay.
+const RETIRE_CONNECTION_MESSAGES: [&str; 2] = [
     "Invalid connection id",
     "Connection does not exist / already disconnected",
 ];
@@ -41,16 +37,13 @@ impl QuackError {
         Self::UnsupportedType(message.into())
     }
 
-    /// The server told us the connection is gone, before running any SQL.
+    /// Whether this error proves that the connection was gone before SQL ran.
     ///
-    /// Retrying the request on a fresh connection cannot duplicate a write.
+    /// Current Quack protocol versions serialize only an error message string.
+    /// SQL can produce the same string as a missing-connection response, so no
+    /// current server error is safe to retry automatically.
     pub fn is_connection_lost(&self) -> bool {
-        match self {
-            Self::Server(message) => CONNECTION_LOST_MESSAGES
-                .iter()
-                .any(|known| message.contains(known)),
-            _ => false,
-        }
+        false
     }
 
     /// The connection that produced this error should not be reused.
@@ -62,7 +55,9 @@ impl QuackError {
     pub fn is_connection_fatal(&self) -> bool {
         match self {
             Self::Http(_) | Self::Protocol(_) => true,
-            Self::Server(_) => self.is_connection_lost(),
+            Self::Server(message) => RETIRE_CONNECTION_MESSAGES
+                .iter()
+                .any(|known| message == known),
             Self::UnsupportedType(_) | Self::Url(_) | Self::Utf8(_) => false,
         }
     }
@@ -73,11 +68,24 @@ mod tests {
     use super::*;
 
     #[test]
-    fn server_connection_errors_are_lost_and_fatal() {
-        for message in CONNECTION_LOST_MESSAGES {
+    fn exact_connection_error_text_retires_but_never_authorizes_replay() {
+        for message in RETIRE_CONNECTION_MESSAGES {
             let err = QuackError::server(message);
-            assert!(err.is_connection_lost(), "{message}");
             assert!(err.is_connection_fatal(), "{message}");
+            assert!(!err.is_connection_lost(), "{message}");
+        }
+    }
+
+    #[test]
+    fn sql_error_text_containing_connection_message_is_not_fatal() {
+        for message in [
+            "Invalid Input Error: Invalid connection id",
+            "statement failed: Invalid connection id after committing",
+            "Connection does not exist / already disconnected (from SQL)",
+        ] {
+            let err = QuackError::server(message);
+            assert!(!err.is_connection_fatal(), "{message}");
+            assert!(!err.is_connection_lost(), "{message}");
         }
     }
 
@@ -89,7 +97,7 @@ mod tests {
     }
 
     #[test]
-    fn transport_errors_are_fatal_but_not_retryable() {
+    fn transport_errors_are_fatal() {
         let err = QuackError::protocol("expected PREPARE_RESPONSE, got FetchResponse");
         assert!(err.is_connection_fatal());
         assert!(!err.is_connection_lost());

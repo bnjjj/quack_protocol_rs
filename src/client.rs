@@ -154,23 +154,39 @@ impl QuackResultStream {
     // stream, which releases the connection.
     //
     // DuckDB reports the rows a DML statement touched as a one-row, one-column
-    // result named `Count`; DDL and other statements report nothing. Anything
-    // else is a query, whose rows are not a count.
-    pub(crate) async fn affected_rows(self) -> Result<Option<u64>> {
-        let (columns, rows) = self.into_rows();
-        let rows: Vec<_> = rows.try_collect().await?;
-        let [column] = columns.as_slice() else {
-            return Ok(None);
-        };
-        if column.name != AFFECTED_ROWS_COLUMN || rows.len() != 1 {
-            return Ok(None);
+    // result named `Count`; DDL and other statements report nothing. The wire
+    // protocol does not carry DuckDB's statement return type, so use the SQL to
+    // distinguish that metadata row from a query that happens to use the same
+    // column name. The exact result shape is still checked below.
+    pub(crate) async fn affected_rows(self, sql: &str) -> Result<Option<u64>> {
+        let QuackResultStream { columns, mut inner } = self;
+        let count_result = statement_returns_affected_rows(sql)
+            && matches!(columns.as_slice(), [column] if column.name == AFFECTED_ROWS_COLUMN);
+        let mut count = None;
+        let mut rows_seen = 0_u8;
+
+        // Always drain the stream, including results that cannot be affected-row
+        // metadata. This releases the connection and surfaces a late FETCH error
+        // while retaining at most the current chunk.
+        while let Some(chunk) = inner.try_next().await? {
+            if !count_result || chunk.row_count == 0 {
+                continue;
+            }
+            if rows_seen == 0 && chunk.row_count == 1 {
+                count = chunk
+                    .column_values(0)
+                    .and_then(|values| values.first())
+                    .and_then(affected_row_count);
+                rows_seen = 1;
+            } else {
+                // The only valid metadata result has exactly one row. Two is a
+                // sufficient sentinel; no total row count needs to be retained.
+                rows_seen = 2;
+                count = None;
+            }
         }
-        Ok(match rows[0].get(AFFECTED_ROWS_COLUMN) {
-            Some(Value::Int(count)) => u64::try_from(*count).ok(),
-            Some(Value::UInt(count)) => Some(*count),
-            Some(Value::HugeInt(count)) => u64::try_from(*count).ok(),
-            _ => None,
-        })
+
+        Ok((rows_seen == 1).then_some(count).flatten())
     }
 
     pub(crate) async fn first_row(self) -> Result<Option<Row>> {
@@ -283,8 +299,9 @@ impl QuackClient {
 
     /// Run a statement and discard its result.
     ///
-    /// Returns the number of rows a DML statement touched, as DuckDB reports
-    /// it, and `None` for DDL and for queries.
+    /// Returns the number of rows a single `INSERT`, `UPDATE`, `DELETE`, or
+    /// `MERGE` touched, as DuckDB reports it. Returns `None` for DDL, queries,
+    /// statements with `RETURNING`, and SQL batches.
     pub async fn execute(
         &self,
         sql: &str,
@@ -292,7 +309,7 @@ impl QuackClient {
     ) -> Result<Option<u64>> {
         self.query_inner(sql, None, metadata)
             .await?
-            .affected_rows()
+            .affected_rows(sql)
             .await
     }
 
@@ -1060,6 +1077,148 @@ pub(crate) fn is_version_negotiation_error(error: &QuackError) -> bool {
         || message.contains("unexpected field")
 }
 
+fn affected_row_count(value: &Value) -> Option<u64> {
+    match value {
+        Value::Int(count) => u64::try_from(*count).ok(),
+        Value::UInt(count) => Some(*count),
+        Value::HugeInt(count) => u64::try_from(*count).ok(),
+        _ => None,
+    }
+}
+
+// PREPARE_RESPONSE has no statement-return-type field. Conservatively identify
+// statements for which DuckDB produces its synthetic `Count` row. Batched SQL
+// is ambiguous because the server may stream an earlier result-producing
+// statement, and a RETURNING clause replaces metadata with ordinary query rows.
+fn statement_returns_affected_rows(sql: &str) -> bool {
+    #[derive(Clone, Copy, Default)]
+    struct Statement {
+        first_keyword_seen: bool,
+        with_clause: bool,
+        dml: bool,
+        returning: bool,
+    }
+
+    impl Statement {
+        fn keyword(&mut self, keyword: &str) {
+            if !self.first_keyword_seen {
+                self.first_keyword_seen = true;
+                self.with_clause = keyword.eq_ignore_ascii_case("WITH");
+                self.dml = is_counted_dml(keyword);
+                return;
+            }
+            if self.with_clause && !self.dml {
+                self.dml = is_counted_dml(keyword);
+            }
+            if self.dml && keyword.eq_ignore_ascii_case("RETURNING") {
+                self.returning = true;
+            }
+        }
+
+        fn returns_count(self) -> bool {
+            self.dml && !self.returning
+        }
+    }
+
+    fn is_counted_dml(keyword: &str) -> bool {
+        keyword.eq_ignore_ascii_case("INSERT")
+            || keyword.eq_ignore_ascii_case("UPDATE")
+            || keyword.eq_ignore_ascii_case("DELETE")
+            || keyword.eq_ignore_ascii_case("MERGE")
+    }
+
+    let bytes = sql.as_bytes();
+    let mut index = 0;
+    let mut depth = 0_usize;
+    let mut statement = Statement::default();
+    let mut completed_statement = None;
+
+    while index < bytes.len() {
+        match bytes[index] {
+            b'\'' => {
+                index += 1;
+                while index < bytes.len() {
+                    if bytes[index] == b'\'' {
+                        index += 1;
+                        if bytes.get(index) != Some(&b'\'') {
+                            break;
+                        }
+                    }
+                    index += 1;
+                }
+            }
+            b'"' => {
+                index += 1;
+                while index < bytes.len() {
+                    if bytes[index] == b'"' {
+                        index += 1;
+                        if bytes.get(index) != Some(&b'"') {
+                            break;
+                        }
+                    }
+                    index += 1;
+                }
+            }
+            b'-' if bytes.get(index + 1) == Some(&b'-') => {
+                index += 2;
+                while index < bytes.len() && bytes[index] != b'\n' {
+                    index += 1;
+                }
+            }
+            b'/' if bytes.get(index + 1) == Some(&b'*') => {
+                index += 2;
+                let mut comment_depth = 1_usize;
+                while index < bytes.len() && comment_depth > 0 {
+                    if bytes[index..].starts_with(b"/*") {
+                        comment_depth += 1;
+                        index += 2;
+                    } else if bytes[index..].starts_with(b"*/") {
+                        comment_depth -= 1;
+                        index += 2;
+                    } else {
+                        index += 1;
+                    }
+                }
+            }
+            b'(' => {
+                depth += 1;
+                index += 1;
+            }
+            b')' => {
+                depth = depth.saturating_sub(1);
+                index += 1;
+            }
+            b';' if depth == 0 => {
+                if statement.first_keyword_seen {
+                    if completed_statement.is_some() {
+                        return false;
+                    }
+                    completed_statement = Some(statement.returns_count());
+                    statement = Statement::default();
+                }
+                index += 1;
+            }
+            byte if depth == 0 && (byte.is_ascii_alphabetic() || byte == b'_') => {
+                let start = index;
+                index += 1;
+                while index < bytes.len()
+                    && (bytes[index].is_ascii_alphanumeric() || bytes[index] == b'_')
+                {
+                    index += 1;
+                }
+                statement.keyword(&sql[start..index]);
+            }
+            _ => index += 1,
+        }
+    }
+
+    if statement.first_keyword_seen {
+        completed_statement.is_none() && statement.returns_count()
+    } else {
+        completed_statement.unwrap_or(false)
+    }
+}
+
 pub(crate) fn parse_quack_uri(input: &str, ssl_override: Option<bool>) -> Result<ParsedQuackUri> {
     let uri = input.trim();
     if uri.is_empty() {
@@ -1176,6 +1335,8 @@ fn expect_success(response: QuackMessage) -> Result<()> {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::builders::{column, data_chunk};
+    use crate::logical_types::LogicalTypes;
 
     // A connection whose session was never negotiated: enough to exercise
     // `Drop`, the one path here that runs without a Quack server.
@@ -1241,6 +1402,89 @@ mod tests {
             QuackClientOptions::default().timeout,
             Some(DEFAULT_QUACK_REQUEST_TIMEOUT)
         );
+    }
+
+    fn count_result(count: i64) -> QuackResultStream {
+        let chunk = data_chunk(vec![column(
+            LogicalTypes::bigint(),
+            [Value::Int(count)],
+            Some(AFFECTED_ROWS_COLUMN.to_string()),
+        )])
+        .expect("count chunk");
+        QuackResultStream::new(
+            vec![ColumnDefinition {
+                name: AFFECTED_ROWS_COLUMN.to_string(),
+                logical_type: LogicalTypes::bigint(),
+            }],
+            stream::iter([Ok(chunk)]).boxed(),
+        )
+    }
+
+    #[tokio::test]
+    async fn affected_rows_requires_dml_not_just_a_count_alias() {
+        assert_eq!(
+            count_result(42)
+                .affected_rows("SELECT 42::BIGINT AS Count")
+                .await
+                .unwrap(),
+            None
+        );
+        assert_eq!(
+            count_result(3)
+                .affected_rows("INSERT INTO items VALUES (1), (2), (3)")
+                .await
+                .unwrap(),
+            Some(3)
+        );
+    }
+
+    #[tokio::test]
+    async fn affected_rows_drains_discarded_queries_and_surfaces_late_errors() {
+        let first_chunk = data_chunk(vec![column(
+            LogicalTypes::bigint(),
+            [Value::Int(3)],
+            Some(AFFECTED_ROWS_COLUMN.to_string()),
+        )])
+        .expect("count chunk");
+        let late_error = QuackError::protocol("late fetch failed");
+        let result = QuackResultStream::new(
+            vec![ColumnDefinition {
+                name: AFFECTED_ROWS_COLUMN.to_string(),
+                logical_type: LogicalTypes::bigint(),
+            }],
+            stream::iter([Ok(first_chunk), Err(late_error)]).boxed(),
+        )
+        .affected_rows("SELECT 3::BIGINT AS Count")
+        .await;
+
+        assert!(
+            matches!(result, Err(QuackError::Protocol(message)) if message == "late fetch failed")
+        );
+    }
+
+    #[test]
+    fn affected_row_statement_classification_handles_result_changing_syntax() {
+        assert!(statement_returns_affected_rows(
+            "WITH ids AS (SELECT 1) UPDATE items SET value = 1"
+        ));
+        assert!(!statement_returns_affected_rows(
+            "WITH ids AS (SELECT 1) SELECT 42 AS Count"
+        ));
+        assert!(!statement_returns_affected_rows(
+            "INSERT INTO items VALUES (1) RETURNING 1 AS Count"
+        ));
+        assert!(!statement_returns_affected_rows(
+            "INSERT INTO items VALUES (1); SELECT 42 AS Count"
+        ));
+        assert!(!statement_returns_affected_rows(
+            "SELECT 42 AS Count; INSERT INTO items VALUES (1)"
+        ));
+        assert!(statement_returns_affected_rows(
+            "DELETE FROM items; -- a trailing comment"
+        ));
+        assert!(statement_returns_affected_rows(
+            "DELETE FROM items WHERE value = '; INSERT'; /* trailing comment */"
+        ));
     }
 
     #[test]

@@ -1,6 +1,5 @@
 //! A pool of Quack sessions, for running queries concurrently.
 
-use std::ops::Deref;
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{Arc, Mutex, PoisonError};
 
@@ -158,14 +157,15 @@ impl QuackPool {
 
     /// Run a statement on any free connection and discard its result.
     ///
-    /// Returns the number of rows a DML statement touched, as DuckDB reports
-    /// it, and `None` for DDL and for queries.
+    /// Returns the number of rows a single `INSERT`, `UPDATE`, `DELETE`, or
+    /// `MERGE` touched, as DuckDB reports it. Returns `None` for DDL, queries,
+    /// statements with `RETURNING`, and SQL batches.
     pub async fn execute(
         &self,
         sql: &str,
         metadata: Option<&QueryMetadata>,
     ) -> Result<Option<u64>> {
-        self.query(sql, metadata).await?.affected_rows().await
+        self.query(sql, metadata).await?.affected_rows(sql).await
     }
 
     pub async fn first(&self, sql: &str) -> Result<Option<Row>> {
@@ -241,53 +241,148 @@ impl QuackPool {
         metadata: Option<&QueryMetadata>,
     ) -> Result<QuackResultStream> {
         let lease = self.acquire().await?;
-        match lease.query_inner(sql, params, metadata).await {
+        match lease.client().query_inner(sql, params, metadata).await {
             Ok(stream) => Ok(attach_lease(stream, lease)),
-            // The server does not know this session - it restarted, or the
-            // session was closed from elsewhere. It rejects such a request
-            // before running any SQL, so nothing has happened that a retry
-            // could repeat. Every idle connection was opened against the same
-            // server, so retire them all and start from a fresh one.
-            //
-            // Only PREPARE is retried. Once results are streaming the
-            // statement has already run, and errors from FETCH are passed
-            // through untouched.
-            Err(err) if err.is_connection_lost() => {
-                drop(lease);
-                self.inner.retire_idle();
-                let permit = self.inner.permit().await?;
-                let lease = self.inner.lease(self.inner.connect_one().await?, permit);
-                let stream = lease.query_inner(sql, params, metadata).await?;
-                Ok(attach_lease(stream, lease))
+            Err(error) => {
+                // Keep the permit while retiring a failed session. In the
+                // ambiguous error-text case this closes a still-live session;
+                // for a genuinely stale id the disconnect simply fails. A
+                // later explicit call can then open a replacement without a
+                // healthy old session temporarily exceeding the pool limit.
+                if error.is_connection_fatal() {
+                    let _ = lease.disconnect().await;
+                }
+                Err(error)
             }
-            Err(err) => Err(err),
         }
     }
 }
 
 /// A connection borrowed from a [`QuackPool`].
 ///
-/// Derefs to the underlying [`QuackClient`], and returns the connection to the
-/// pool when dropped.
-#[derive(Debug)]
+/// This handle may be cloned, and a query stream may outlive the handle that
+/// created it. All such handles share ownership of the lease; the connection
+/// returns to the pool only after the last handle or result stream is dropped.
+///
+/// The underlying [`QuackClient`] is intentionally not exposed. Giving out a
+/// raw client clone would let it keep using the session after the pool had
+/// assigned that session to another borrower.
+///
+/// ```compile_fail
+/// # use quack_protocol::{QuackClient, QuackPool, Result};
+/// # async fn cannot_extract_client(pool: &QuackPool) -> Result<()> {
+/// let lease = pool.acquire().await?;
+/// let raw_client = QuackClient::clone(&lease);
+/// # let _ = raw_client;
+/// # Ok(())
+/// # }
+/// ```
+#[derive(Clone, Debug)]
 pub struct PooledClient {
+    inner: Arc<PooledClientInner>,
+    /// Connection metadata reported when this session was opened.
+    pub info: Option<QuackConnectionInfo>,
+}
+
+#[derive(Debug)]
+struct PooledClientInner {
     // `Some` until `Drop` hands the client back.
     client: Option<QuackClient>,
     pool: Arc<PoolInner>,
     _permit: OwnedSemaphorePermit,
 }
 
-impl Deref for PooledClient {
-    type Target = QuackClient;
-
-    fn deref(&self) -> &Self::Target {
-        self.client
+impl PooledClient {
+    fn client(&self) -> &QuackClient {
+        self.inner
+            .client
             .as_ref()
             .expect("pooled client is taken only by Drop")
     }
+
+    pub fn is_connected(&self) -> bool {
+        self.client().is_connected()
+    }
+
+    /// Run a statement on this leased session and discard its result.
+    ///
+    /// Returns affected rows under the same rules as [`QuackPool::execute`].
+    pub async fn execute(
+        &self,
+        sql: &str,
+        metadata: Option<&QueryMetadata>,
+    ) -> Result<Option<u64>> {
+        self.query(sql, metadata).await?.affected_rows(sql).await
+    }
+
+    /// Run a query on this leased session.
+    ///
+    /// The returned stream retains a clone of the lease, so dropping this
+    /// handle does not return the session while the stream is still alive.
+    pub async fn query(
+        &self,
+        sql: &str,
+        metadata: Option<&QueryMetadata>,
+    ) -> Result<QuackResultStream> {
+        let stream = self.client().query_inner(sql, None, metadata).await?;
+        Ok(attach_lease(stream, self.clone()))
+    }
+
+    pub async fn query_with_params(
+        &self,
+        sql: &str,
+        params: Option<&SqlParameters>,
+    ) -> Result<QuackResultStream> {
+        let stream = self.client().query_inner(sql, params, None).await?;
+        Ok(attach_lease(stream, self.clone()))
+    }
+
+    pub async fn first(&self, sql: &str) -> Result<Option<Row>> {
+        self.query(sql, None).await?.first_row().await
+    }
+
+    pub async fn one(&self, sql: &str) -> Result<Row> {
+        self.query(sql, None).await?.one_row().await
+    }
+
+    pub async fn values(&self, sql: &str) -> Result<Vec<Value>> {
+        self.query(sql, None).await?.first_column().await
+    }
+
+    pub async fn append(
+        &self,
+        table_name: impl Into<String>,
+        schema_name: Option<String>,
+        chunk: DataChunk,
+    ) -> Result<()> {
+        self.client().append(table_name, schema_name, chunk).await
+    }
+
+    pub async fn append_rows(
+        &self,
+        table_name: impl Into<String>,
+        schema_name: Option<String>,
+        rows: &[Row],
+        columns: Option<Vec<ColumnDefinition>>,
+        batch_size: Option<usize>,
+    ) -> Result<()> {
+        self.client()
+            .append_rows(table_name, schema_name, rows, columns, batch_size)
+            .await
+    }
+
+    /// Close this leased session. The pool retires it after all lease handles
+    /// and streams have been dropped.
+    pub async fn disconnect(&self) -> Result<()> {
+        self.client().disconnect().await
+    }
+
+    pub async fn close(&self) -> Result<()> {
+        self.disconnect().await
+    }
 }
 
-impl Drop for PooledClient {
+impl Drop for PooledClientInner {
     fn drop(&mut self) {
         if let Some(client) = self.client.take() {
             self.pool.release(client);
@@ -317,10 +412,14 @@ impl PoolInner {
     }
 
     fn lease(self: &Arc<Self>, client: QuackClient, permit: OwnedSemaphorePermit) -> PooledClient {
+        let info = client.info.clone();
         PooledClient {
-            client: Some(client),
-            pool: Arc::clone(self),
-            _permit: permit,
+            inner: Arc::new(PooledClientInner {
+                client: Some(client),
+                pool: Arc::clone(self),
+                _permit: permit,
+            }),
+            info,
         }
     }
 
@@ -351,12 +450,6 @@ impl PoolInner {
         self.lock_idle().push(client);
     }
 
-    // Closes every idle session: the clients are dropped here, and dropping
-    // the last handle to one sends its DISCONNECT.
-    fn retire_idle(&self) {
-        drop(self.drain_idle());
-    }
-
     fn drain_idle(&self) -> Vec<QuackClient> {
         std::mem::take(&mut *self.lock_idle())
     }
@@ -383,7 +476,51 @@ fn attach_lease(stream: QuackResultStream, lease: PooledClient) -> QuackResultSt
 
 #[cfg(test)]
 mod tests {
+    use std::io::{Read, Write};
+    use std::net::TcpListener;
+    use std::thread;
+    use std::time::Duration;
+
     use super::*;
+    use crate::binary::HugeIntParts;
+    use crate::constants::QUACK_V1;
+    use crate::messages::{MessageHeader, MessageType, QuackMessage, encode_message_for_version};
+
+    fn scripted_server(responses: Vec<QuackMessage>) -> (String, thread::JoinHandle<()>) {
+        let listener = TcpListener::bind("127.0.0.1:0").expect("bind test server");
+        let address = listener.local_addr().expect("test server address");
+        let responses = responses
+            .into_iter()
+            .map(|response| {
+                encode_message_for_version(&response, QUACK_V1).expect("encode test response")
+            })
+            .collect::<Vec<_>>();
+        let server = thread::spawn(move || {
+            for response in responses {
+                let (mut socket, _) = listener.accept().expect("accept test request");
+                let mut request = [0; 4096];
+                let bytes_read = socket.read(&mut request).expect("read test request");
+                assert!(bytes_read > 0, "test request must not be empty");
+                write!(
+                    socket,
+                    "HTTP/1.1 200 OK\r\nContent-Length: {}\r\nConnection: close\r\n\r\n",
+                    response.len()
+                )
+                .expect("write test response headers");
+                socket.write_all(&response).expect("write test response");
+            }
+        });
+        (format!("http://{address}"), server)
+    }
+
+    fn v1_options() -> QuackClientOptions {
+        QuackClientOptions {
+            min_supported_quack_version: Some(QUACK_V1),
+            max_supported_quack_version: Some(QUACK_V1),
+            timeout: Some(Duration::from_secs(2)),
+            ..QuackClientOptions::default()
+        }
+    }
 
     #[tokio::test]
     async fn rejects_an_empty_pool() {
@@ -403,5 +540,107 @@ mod tests {
             QuackPoolOptions::default().max_connections,
             DEFAULT_MAX_CONNECTIONS
         );
+    }
+
+    #[test]
+    fn cloning_a_pooled_client_produces_another_lease() {
+        let clone_lease: fn(&PooledClient) -> PooledClient = PooledClient::clone;
+        let _ = clone_lease;
+    }
+
+    #[tokio::test]
+    async fn clones_and_query_streams_keep_the_pool_lease() {
+        let connection_response = QuackMessage::ConnectionResponse {
+            header: MessageHeader::new(MessageType::ConnectionResponse)
+                .with_connection("leased-session"),
+            server_duckdb_version: None,
+            server_platform: None,
+            quack_version: Some(QUACK_V1),
+            heartbeat_timeout_seconds: None,
+        };
+        let prepare_response = QuackMessage::PrepareResponse {
+            header: MessageHeader::new(MessageType::PrepareResponse)
+                .with_connection("leased-session"),
+            result_types: Vec::new(),
+            result_names: Vec::new(),
+            needs_more_fetch: false,
+            results: Vec::new(),
+            result_uuid: HugeIntParts { upper: 0, lower: 1 },
+        };
+        let (uri, server) = scripted_server(vec![connection_response, prepare_response]);
+        let pool = QuackPool::connect(&uri, v1_options(), QuackPoolOptions { max_connections: 1 })
+            .await
+            .expect("connect pool");
+
+        let lease = pool.acquire().await.expect("acquire lease");
+        let cloned_lease = lease.clone();
+        drop(lease);
+        assert!(
+            tokio::time::timeout(Duration::from_millis(50), pool.acquire())
+                .await
+                .is_err(),
+            "a cloned handle must keep the permit"
+        );
+
+        let stream = cloned_lease
+            .query("SELECT 1", None)
+            .await
+            .expect("create result stream");
+        drop(cloned_lease);
+        assert!(
+            tokio::time::timeout(Duration::from_millis(50), pool.acquire())
+                .await
+                .is_err(),
+            "a result stream must keep the permit"
+        );
+
+        drop(stream);
+        let returned = tokio::time::timeout(Duration::from_secs(1), pool.acquire())
+            .await
+            .expect("released stream should unblock acquire")
+            .expect("reacquire returned session");
+        drop(returned);
+        server.join().expect("test server");
+    }
+
+    #[tokio::test]
+    async fn ambiguous_connection_error_text_is_returned_without_replay() {
+        let connection_response = QuackMessage::ConnectionResponse {
+            header: MessageHeader::new(MessageType::ConnectionResponse)
+                .with_connection("possibly-stale-session"),
+            server_duckdb_version: None,
+            server_platform: None,
+            quack_version: Some(QUACK_V1),
+            heartbeat_timeout_seconds: None,
+        };
+        let ambiguous_error = QuackMessage::ErrorResponse {
+            header: MessageHeader::new(MessageType::ErrorResponse),
+            message: "Invalid connection id".to_string(),
+        };
+        let disconnect_response = QuackMessage::SuccessResponse {
+            header: MessageHeader::new(MessageType::SuccessResponse),
+        };
+        let (uri, server) = scripted_server(vec![
+            connection_response,
+            ambiguous_error,
+            disconnect_response,
+        ]);
+        let pool = QuackPool::connect(&uri, v1_options(), QuackPoolOptions { max_connections: 1 })
+            .await
+            .expect("connect pool");
+
+        let error = match pool.query("INSERT INTO items VALUES (1)", None).await {
+            Ok(_) => panic!("ambiguous server text must be surfaced"),
+            Err(error) => error,
+        };
+        assert!(
+            matches!(error, QuackError::Server(ref message) if message == "Invalid connection id"),
+            "the original server error must be returned: {error}"
+        );
+
+        // The third response acknowledges DISCONNECT. If the pool replayed the
+        // statement, it would consume that response as another CONNECT and
+        // return a protocol error instead of the original server error above.
+        server.join().expect("test server");
     }
 }
