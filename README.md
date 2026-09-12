@@ -8,6 +8,7 @@ DuckDB 2.0 alpha:
 - DuckDB `BinarySerializer`-compatible primitive, object, logical type, vector, and `DataChunk` codecs.
 - Quack connection leases and heartbeats, prepare/query, acknowledged fetch streaming,
   disconnect, success, and error messages.
+- A session pool for running queries concurrently against one server.
 - Async HTTP `POST /quack` transport using `application/duckdb`.
 - URI parsing for `localhost:9494`, `quack:host:port`, bracketed IPv6, and direct HTTP(S) URLs.
 - SQL literal formatting for positional and named parameters.
@@ -38,6 +39,100 @@ async fn main() -> Result<()> {
     Ok(())
 }
 ```
+
+## Connection model
+
+A `QuackClient` is **one session** on the server: one connection id, for the
+client's whole life and for every clone of it. Two things follow.
+
+**Queries on one client are serialized.** The server keeps a single resumable
+result cursor per connection id, and a PREPARE resets it - so a second query
+would invalidate a FETCH still in flight. Queries therefore take a lock, and a
+result stream holds it until the stream is drained or dropped. Cloning the
+client does not change that; the clones share the session.
+
+**Session state persists.** Temporary tables, `SET`, transactions, and attached
+databases live on the connection, so consecutive calls on one client see each
+other's effects.
+
+For concurrency, use a `QuackPool`. It keeps several sessions and hands a free
+one to each caller, so N queries run on the server at once - what a query engine
+wants when it opens one scan per partition:
+
+```rust
+use quack_protocol::{QuackClientOptions, QuackPool, QuackPoolOptions, Result};
+
+#[tokio::main]
+async fn main() -> Result<()> {
+    let pool = QuackPool::connect(
+        "localhost:9494",
+        QuackClientOptions::default(),
+        // Size this to the parallelism you want - DataFusion's
+        // `target_partitions`, say. Every connection is a DuckDB connection on
+        // the server.
+        QuackPoolOptions { max_connections: 8 },
+    )
+    .await?;
+
+    // Each concurrent query runs on its own session.
+    let (_columns, chunks) = pool.query("SELECT 42::INTEGER AS answer", None).await?.into_chunks();
+    let _ = chunks;
+    Ok(())
+}
+```
+
+`QuackPool` is cheap to clone and shares its connections, so one pool can back
+every table in a federated catalog. Connections open on demand up to
+`max_connections`; callers past the limit wait for one to come free.
+
+The pool gives **no session affinity** between calls: two `pool.query()` calls
+may land on different sessions, so a temp table created by one is invisible to
+the other. Work that depends on session state takes a connection out of the pool
+and holds it:
+
+```rust,ignore
+let connection = pool.acquire().await?;
+connection.execute("CREATE TEMP TABLE staging AS SELECT 1 AS id", None).await?;
+let ids = connection.values("SELECT id FROM staging").await?;
+// `connection` goes back to the pool when it is dropped.
+```
+
+For a single `INSERT`, `UPDATE`, `DELETE`, or `MERGE`, `execute()` returns the
+rows DuckDB reports as touched. It returns `None` for DDL, queries, statements
+with `RETURNING`, and SQL batches. `QuackClientOptions` redacts `auth_token` in
+its `Debug` output, and the crate re-exports `HeaderMap`, `HeaderName`, and
+`HeaderValue` for `QuackClientOptions::headers` so callers need not depend on
+`reqwest`.
+
+A stream returned by `pool.query()` holds its connection until it is drained or
+dropped, so drop it when the results are no longer wanted rather than leaving it
+parked - the connection is not free until then.
+
+### Closing sessions
+
+A session the client no longer holds is closed, so the server does not keep a
+cursor for a connection id nobody can use again:
+
+- `disconnect()` (on a client, `close()` on a pool) closes deterministically and
+  reports failure.
+- Dropping the last handle to a client - or the pool that holds it - sends the
+  DISCONNECT from a background task. That is best-effort: it only goes out while
+  the Tokio runtime is alive, so call `disconnect()`/`close()` when the program
+  is about to exit or the outcome matters.
+
+### When the server forgets a connection
+
+After a server restart, a session opened against the old server is gone and the
+server answers `Invalid connection id`. Current Quack protocol versions carry
+only the error text, however, and SQL can raise exactly the same message after
+an earlier statement committed. The client therefore never retries a statement
+automatically.
+
+The pool retires a session when the response exactly matches a known stale
+connection message, but returns the error to the caller. A later pool call opens
+a fresh session within `max_connections`. A plain `QuackClient` does not
+reconnect; it is one session, and quietly opening another would drop the session
+state that came with it.
 
 ## Arrow output
 
@@ -79,7 +174,9 @@ crates, so downstream code can match versions.
 The batch stream holds the client's connection until it is drained or dropped,
 as `into_chunks()` and `into_rows()` do: a `QuackClient` runs one query at a
 time, and a second query on the same client waits for the first stream to
-finish.
+finish. `QuackPool::query` returns the same `QuackResultStream`, so
+`into_record_batches()` works there too - and concurrent scans then run on
+separate sessions. See [Connection model](#connection-model).
 
 ### Type mapping
 
