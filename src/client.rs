@@ -379,7 +379,7 @@ impl QuackClient {
                     result_uuid,
                 ),
                 other => {
-                    return Err(QuackError::protocol(format!(
+                    return Err(connection.protocol_failure(format!(
                         "expected PREPARE_RESPONSE, got {:?}",
                         other.message_type()
                     )));
@@ -449,7 +449,7 @@ impl QuackClient {
                         batch_index,
                         ..
                     } => (results, total_batches, batch_index),
-                    other => Err(QuackError::protocol(format!(
+                    other => Err(connection.protocol_failure(format!(
                         "expected FETCH_RESPONSE, got {:?}",
                         other.message_type()
                     )))?,
@@ -459,31 +459,31 @@ impl QuackClient {
                     match batch_index {
                         Some(batch_index) if batch_index == next_batch_index => {
                             if results.is_empty() {
-                                Err(QuackError::protocol(
+                                Err(connection.protocol_failure(
                                     "FETCH_RESPONSE batch did not include any chunks",
                                 ))?;
                             }
                             ack_index = batch_index;
                             next_batch_index = next_batch_index.checked_add(1).ok_or_else(|| {
-                                QuackError::protocol("FETCH_RESPONSE batch index overflow")
+                                connection.protocol_failure("FETCH_RESPONSE batch index overflow")
                             })?;
                         }
                         // A v3 FETCH_REQUEST asks for one exact batch. The server may produce
                         // batches out of order internally, but it must answer with the requested
                         // index; accepting another index here would silently reorder the result.
-                        Some(batch_index) => Err(QuackError::protocol(format!(
+                        Some(batch_index) => Err(connection.protocol_failure(format!(
                             "expected FETCH_RESPONSE batch {next_batch_index}, got {batch_index}"
                         )))?,
                         None if results.is_empty() => {
                             if let Some(total_batches) = total_batches {
                                 if total_batches != ack_index {
-                                    Err(QuackError::protocol(format!(
+                                    Err(connection.protocol_failure(format!(
                                         "FETCH_RESPONSE ended after {ack_index} batches but announced {total_batches}"
                                     )))?;
                                 }
                             }
                         }
-                        None => Err(QuackError::protocol(
+                        None => Err(connection.protocol_failure(
                             "FETCH_RESPONSE with chunks did not include a batch index",
                         ))?,
                     }
@@ -808,7 +808,8 @@ impl Connection {
             table_name,
             append_chunk: chunk,
         };
-        expect_success(self.send(&message).await?)
+        let response = self.send(&message).await?;
+        self.expect_success(response)
     }
 
     async fn disconnect(&self) -> Result<()> {
@@ -819,9 +820,28 @@ impl Connection {
             header: self.scoped_header(MessageType::DisconnectMessage),
         };
         let response = self.send(&message).await?;
-        expect_success(response)?;
+        self.expect_success(response)?;
         self.state.close();
         Ok(())
+    }
+
+    fn expect_success(&self, response: QuackMessage) -> Result<()> {
+        match response {
+            QuackMessage::SuccessResponse { .. } => Ok(()),
+            other => Err(self.protocol_failure(format!(
+                "expected SUCCESS_RESPONSE, got {:?}",
+                other.message_type()
+            ))),
+        }
+    }
+
+    // A response that decoded but does not fit the protocol. `send` only sees
+    // transport and framing failures; a well-formed message of the wrong type
+    // or with inconsistent batch metadata is detected by the caller, and still
+    // leaves the session in an unknown state, so it is retired the same way.
+    fn protocol_failure(&self, message: impl Into<String>) -> QuackError {
+        self.state.degrade();
+        QuackError::protocol(message)
     }
 
     fn scoped_header(&self, message_type: MessageType) -> MessageHeader {
@@ -1159,6 +1179,18 @@ fn statement_returns_affected_rows(sql: &str) -> bool {
                     index += 1;
                 }
             }
+            // Dollar-quoted string: `$$...$$` or `$tag$...$tag$`, with no
+            // escaping inside. A lone `$1` is a positional parameter.
+            b'$' => match dollar_quote_delimiter(&bytes[index..]) {
+                Some(delimiter) => {
+                    index += delimiter.len();
+                    index = bytes[index..]
+                        .windows(delimiter.len())
+                        .position(|window| window == delimiter)
+                        .map_or(bytes.len(), |end| index + end + delimiter.len());
+                }
+                None => index += 1,
+            },
             b'-' if bytes.get(index + 1) == Some(&b'-') => {
                 index += 2;
                 while index < bytes.len() && bytes[index] != b'\n' {
@@ -1217,6 +1249,23 @@ fn statement_returns_affected_rows(sql: &str) -> bool {
     } else {
         completed_statement.unwrap_or(false)
     }
+}
+
+// The `$tag$` opening a dollar-quoted string at the start of `bytes`, if any.
+fn dollar_quote_delimiter(bytes: &[u8]) -> Option<&[u8]> {
+    let mut end = 1;
+    while let Some(&byte) = bytes.get(end) {
+        let allowed = if end == 1 {
+            byte.is_ascii_alphabetic() || byte == b'_'
+        } else {
+            byte.is_ascii_alphanumeric() || byte == b'_'
+        };
+        if !allowed {
+            break;
+        }
+        end += 1;
+    }
+    (bytes.get(end) == Some(&b'$')).then(|| &bytes[..=end])
 }
 
 pub(crate) fn parse_quack_uri(input: &str, ssl_override: Option<bool>) -> Result<ParsedQuackUri> {
@@ -1319,16 +1368,6 @@ fn parse_port(value: &str) -> Result<u16> {
 fn attach_column_names(chunks: &mut [DataChunk], names: &[String]) {
     for chunk in chunks {
         chunk.column_names = Some(names.to_vec());
-    }
-}
-
-fn expect_success(response: QuackMessage) -> Result<()> {
-    match response {
-        QuackMessage::SuccessResponse { .. } => Ok(()),
-        other => Err(QuackError::protocol(format!(
-            "expected SUCCESS_RESPONSE, got {:?}",
-            other.message_type()
-        ))),
     }
 }
 
@@ -1485,6 +1524,27 @@ mod tests {
         assert!(statement_returns_affected_rows(
             "DELETE FROM items WHERE value = '; INSERT'; /* trailing comment */"
         ));
+    }
+
+    #[test]
+    fn affected_row_statement_classification_skips_dollar_quoted_strings() {
+        assert!(!statement_returns_affected_rows(
+            "INSERT INTO items VALUES ($$($$) RETURNING 42::BIGINT AS Count"
+        ));
+        assert!(statement_returns_affected_rows(
+            "INSERT INTO items VALUES ($$; SELECT 1 AS Count$$)"
+        ));
+        assert!(statement_returns_affected_rows(
+            "INSERT INTO items VALUES ($tag$ '$$' RETURNING $tag$)"
+        ));
+        assert!(!statement_returns_affected_rows(
+            "INSERT INTO items VALUES ($tag$($tag$) RETURNING 1 AS Count"
+        ));
+        assert!(!statement_returns_affected_rows(
+            "INSERT INTO items VALUES ($1) RETURNING 1 AS Count"
+        ));
+        // An unterminated quote swallows the rest of the statement, not the process.
+        let _ = statement_returns_affected_rows("INSERT INTO items VALUES ($$unterminated");
     }
 
     #[test]

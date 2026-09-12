@@ -73,7 +73,10 @@ impl Default for QuackPoolOptions {
 /// Connections open on demand up to
 /// [`max_connections`](QuackPoolOptions::max_connections) and are reused
 /// afterwards. A connection that saw a wire failure is retired rather than
-/// handed on, and retiring it closes its session on the server.
+/// handed on, and retiring it closes its session on the server. Nothing is
+/// opened in its place until a later [`acquire`](Self::acquire) finds no idle
+/// connection, and the retired session keeps its slot until its DISCONNECT
+/// has been answered, so the pool never has more sessions open than its limit.
 #[derive(Clone, Debug)]
 pub struct QuackPool {
     inner: Arc<PoolInner>,
@@ -218,12 +221,12 @@ impl QuackPool {
     /// Connections still leased are closed as their leases drop. Returns the
     /// first failure, after trying to close all of them.
     pub async fn close(&self) -> Result<()> {
-        self.inner.closed.store(true, Ordering::Relaxed);
+        let idle = self.inner.close_and_drain();
         // Wakes anyone waiting on `acquire` with a "pool is closed" error.
         self.inner.permits.close();
 
         let mut first_error = None;
-        for client in self.inner.drain_idle() {
+        for client in idle {
             if let Err(err) = client.disconnect().await {
                 first_error.get_or_insert(err);
             }
@@ -286,10 +289,10 @@ pub struct PooledClient {
 
 #[derive(Debug)]
 struct PooledClientInner {
-    // `Some` until `Drop` hands the client back.
+    // Both `Some` until `Drop` hands them back.
     client: Option<QuackClient>,
+    permit: Option<OwnedSemaphorePermit>,
     pool: Arc<PoolInner>,
-    _permit: OwnedSemaphorePermit,
 }
 
 impl PooledClient {
@@ -384,11 +387,28 @@ impl PooledClient {
 
 impl Drop for PooledClientInner {
     fn drop(&mut self) {
-        if let Some(client) = self.client.take() {
-            self.pool.release(client);
-        }
-        // The permit drops next, after the connection is back in the pool, so
-        // a waiter that wakes on it finds the connection waiting.
+        let Some(client) = self.client.take() else {
+            return;
+        };
+        let Some(retired) = self.pool.release(client) else {
+            // The permit drops next, after the connection is back in the
+            // pool, so a waiter that wakes on it finds the connection waiting.
+            return;
+        };
+        // Retired: the permit stays with the session until its DISCONNECT is
+        // answered, so the caller that wakes on it opens a replacement only
+        // once the old session is gone. Without a runtime the client's own
+        // `Drop` logs and gives up, and the permit is released here.
+        let Ok(runtime) = tokio::runtime::Handle::try_current() else {
+            return;
+        };
+        let permit = self.permit.take();
+        runtime.spawn(async move {
+            // Failures are logged by `Connection`; there is no caller to tell.
+            let _ = retired.disconnect().await;
+            drop(retired);
+            drop(permit);
+        });
     }
 }
 
@@ -416,8 +436,8 @@ impl PoolInner {
         PooledClient {
             inner: Arc::new(PooledClientInner {
                 client: Some(client),
+                permit: Some(permit),
                 pool: Arc::clone(self),
-                _permit: permit,
             }),
             info,
         }
@@ -442,16 +462,23 @@ impl PoolInner {
         None
     }
 
-    fn release(&self, client: QuackClient) {
+    // Puts a connection back, or returns it when it must be retired instead:
+    // the pool is closed or the session saw a wire failure. The closed check
+    // happens under the idle lock so that `close_and_drain` cannot run between
+    // the check and the push and leave a live session behind in a closed pool.
+    fn release(&self, client: QuackClient) -> Option<QuackClient> {
+        let mut idle = self.lock_idle();
         if self.closed.load(Ordering::Relaxed) || !client.is_reusable() {
-            // Dropping the last handle closes the session on the server.
-            return;
+            return Some(client);
         }
-        self.lock_idle().push(client);
+        idle.push(client);
+        None
     }
 
-    fn drain_idle(&self) -> Vec<QuackClient> {
-        std::mem::take(&mut *self.lock_idle())
+    fn close_and_drain(&self) -> Vec<QuackClient> {
+        let mut idle = self.lock_idle();
+        self.closed.store(true, Ordering::Relaxed);
+        std::mem::take(&mut *idle)
     }
 
     // The lock guards a `Vec` and nothing else, so a panic elsewhere in the
@@ -600,6 +627,85 @@ mod tests {
             .expect("released stream should unblock acquire")
             .expect("reacquire returned session");
         drop(returned);
+        server.join().expect("test server");
+    }
+
+    fn connection_response(connection_id: &str) -> QuackMessage {
+        QuackMessage::ConnectionResponse {
+            header: MessageHeader::new(MessageType::ConnectionResponse)
+                .with_connection(connection_id),
+            server_duckdb_version: None,
+            server_platform: None,
+            quack_version: Some(QUACK_V1),
+            heartbeat_timeout_seconds: None,
+        }
+    }
+
+    fn success_response() -> QuackMessage {
+        QuackMessage::SuccessResponse {
+            header: MessageHeader::new(MessageType::SuccessResponse),
+        }
+    }
+
+    #[tokio::test]
+    async fn a_malformed_response_retires_the_session() {
+        // SUCCESS in answer to PREPARE decodes fine but is the wrong message.
+        let (uri, server) = scripted_server(vec![
+            connection_response("malformed-session"),
+            success_response(),
+            success_response(),
+        ]);
+        let client = QuackClient::connect(&uri, v1_options())
+            .await
+            .expect("connect client");
+        assert!(client.is_reusable());
+
+        let error = match client.query("SELECT 1", None).await {
+            Ok(_) => panic!("wrong response type is a protocol error"),
+            Err(error) => error,
+        };
+        assert!(
+            matches!(error, QuackError::Protocol(ref message) if message.contains("PREPARE_RESPONSE")),
+            "{error}"
+        );
+        assert!(
+            !client.is_reusable(),
+            "a session that answered out of protocol must not be handed on"
+        );
+
+        client.disconnect().await.expect("disconnect");
+        server.join().expect("test server");
+    }
+
+    #[tokio::test]
+    async fn a_retired_lease_keeps_its_slot_until_the_session_is_closed() {
+        // Response order is the whole assertion: with one slot, the
+        // replacement CONNECT must come after the retired session's
+        // DISCONNECT. If the permit were released early, the replacement
+        // would consume the DISCONNECT acknowledgement and fail to connect.
+        let (uri, server) = scripted_server(vec![
+            connection_response("retired-session"),
+            success_response(), // wrong answer to PREPARE: retires the session
+            success_response(), // acknowledges DISCONNECT
+            connection_response("replacement-session"),
+        ]);
+        let pool = QuackPool::connect(&uri, v1_options(), QuackPoolOptions { max_connections: 1 })
+            .await
+            .expect("connect pool");
+
+        let lease = pool.acquire().await.expect("acquire lease");
+        assert!(
+            lease.query("SELECT 1", None).await.is_err(),
+            "wrong response type is a protocol error"
+        );
+        drop(lease);
+
+        let replacement = tokio::time::timeout(Duration::from_secs(2), pool.acquire())
+            .await
+            .expect("slot frees once the retired session is closed")
+            .expect("replacement connects after the DISCONNECT");
+        assert!(replacement.is_connected());
+        drop(replacement);
         server.join().expect("test server");
     }
 

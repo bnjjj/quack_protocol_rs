@@ -37,21 +37,17 @@ impl QuackError {
         Self::UnsupportedType(message.into())
     }
 
-    /// Whether this error proves that the connection was gone before SQL ran.
-    ///
-    /// Current Quack protocol versions serialize only an error message string.
-    /// SQL can produce the same string as a missing-connection response, so no
-    /// current server error is safe to retry automatically.
-    pub fn is_connection_lost(&self) -> bool {
-        false
-    }
-
     /// The connection that produced this error should not be reused.
     ///
     /// Transport and framing failures leave no way to tell what the server did
     /// with the request, so a pool retires the connection rather than hand it
     /// to the next caller. Errors raised without touching the wire - bad
     /// arguments, unsupported types - are not counted.
+    ///
+    /// This says nothing about whether the request ran. Current protocol
+    /// versions carry only an error message string, and SQL can produce the
+    /// same text as a missing-connection response, so no error is safe to
+    /// retry automatically.
     pub fn is_connection_fatal(&self) -> bool {
         match self {
             Self::Http(_) | Self::Protocol(_) => true,
@@ -68,11 +64,10 @@ mod tests {
     use super::*;
 
     #[test]
-    fn exact_connection_error_text_retires_but_never_authorizes_replay() {
+    fn exact_connection_error_text_retires() {
         for message in RETIRE_CONNECTION_MESSAGES {
             let err = QuackError::server(message);
             assert!(err.is_connection_fatal(), "{message}");
-            assert!(!err.is_connection_lost(), "{message}");
         }
     }
 
@@ -85,14 +80,12 @@ mod tests {
         ] {
             let err = QuackError::server(message);
             assert!(!err.is_connection_fatal(), "{message}");
-            assert!(!err.is_connection_lost(), "{message}");
         }
     }
 
     #[test]
     fn sql_errors_leave_the_connection_usable() {
         let err = QuackError::server("Table with name t does not exist!");
-        assert!(!err.is_connection_lost());
         assert!(!err.is_connection_fatal());
     }
 
@@ -100,6 +93,5 @@ mod tests {
     fn transport_errors_are_fatal() {
         let err = QuackError::protocol("expected PREPARE_RESPONSE, got FetchResponse");
         assert!(err.is_connection_fatal());
-        assert!(!err.is_connection_lost());
     }
 }
