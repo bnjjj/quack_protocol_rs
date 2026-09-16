@@ -97,12 +97,9 @@ let ids = connection.values("SELECT id FROM staging").await?;
 // `connection` goes back to the pool when it is dropped.
 ```
 
-For a single `INSERT`, `UPDATE`, `DELETE`, or `MERGE`, `execute()` returns the
-rows DuckDB reports as touched. It returns `None` for DDL, queries, statements
-with `RETURNING`, and SQL batches. `QuackClientOptions` redacts `auth_token` in
-its `Debug` output, and the crate re-exports `HeaderMap`, `HeaderName`, and
-`HeaderValue` for `QuackClientOptions::headers` so callers need not depend on
-`reqwest`.
+`QuackClientOptions` redacts `auth_token` in its `Debug` output. Extra HTTP
+headers go in `QuackClientOptions::headers` as name/value pairs; an invalid
+name or value is reported when the client connects.
 
 A stream returned by `pool.query()` holds its connection until it is drained or
 dropped, so drop it when the results are no longer wanted rather than leaving it
