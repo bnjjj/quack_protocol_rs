@@ -3,6 +3,9 @@
 //! The crate implements the HTTP client transport plus the DuckDB
 //! `BinarySerializer`-compatible message, logical type, and `DataChunk` codecs
 //! needed by a Quack client.
+//!
+//! [`QuackClient`] is one session on the server and runs one query at a time;
+//! [`QuackPool`] keeps several sessions so queries can run concurrently.
 
 #[cfg(feature = "arrow")]
 pub mod arrow;
@@ -14,6 +17,7 @@ mod errors;
 mod json;
 mod logical_types;
 mod messages;
+mod pool;
 mod sql;
 mod values;
 mod vector;
@@ -31,6 +35,7 @@ pub use json::{
 pub use logical_types::{
     ChildType, CoordinateReferenceSystem, ExtraTypeInfo, LogicalType, LogicalTypeId, LogicalTypes,
 };
+pub use pool::{DEFAULT_MAX_CONNECTIONS, PooledClient, QuackPool, QuackPoolOptions};
 pub use sql::{SqlParameter, SqlParameters, format_sql, sql_literal};
 pub use values::{
     date_from_iso_date, date_value, decimal_value, interval_value, time_tz_value, time_value,

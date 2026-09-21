@@ -1,12 +1,12 @@
 use std::iter::zip;
-use std::sync::atomic::{AtomicU64, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use std::sync::{Arc, Mutex as StdMutex};
 use std::time::{Duration, Instant};
 
 use async_stream::try_stream;
 use futures_util::stream::{self, BoxStream};
 use futures_util::{StreamExt, TryStreamExt};
-use reqwest::header::{ACCEPT, CONTENT_TYPE, HeaderMap, HeaderValue};
+use reqwest::header::{ACCEPT, CONTENT_TYPE, HeaderMap, HeaderName, HeaderValue};
 use tokio::sync::{Mutex, OwnedMutexGuard};
 
 use crate::binary::HugeIntParts;
@@ -26,6 +26,9 @@ use crate::vector::{DataChunk, Row, Value, rows_from_chunk_with_names};
 
 const DEFAULT_QUACK_REQUEST_TIMEOUT: Duration = Duration::from_secs(300);
 const DEFAULT_QUACK_CONNECT_TIMEOUT: Duration = Duration::from_secs(10);
+// A DISCONNECT sent from `Drop` runs detached, with no caller left to observe
+// it, so it is not given the full request timeout to hang around for.
+const DISCONNECT_ON_DROP_TIMEOUT: Duration = Duration::from_secs(10);
 
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub(crate) struct ParsedQuackUri {
@@ -35,8 +38,9 @@ pub(crate) struct ParsedQuackUri {
     pub(crate) ssl: bool,
 }
 
-#[derive(Clone, Debug)]
+#[derive(Clone)]
 pub struct QuackClientOptions {
+    /// Sent to the server on connect; redacted in `Debug` output.
     pub auth_token: Option<String>,
     pub client_duckdb_version: Option<String>,
     pub client_platform: Option<String>,
@@ -46,7 +50,35 @@ pub struct QuackClientOptions {
     pub heartbeat_timeout: Option<Duration>,
     pub ssl: Option<bool>,
     pub timeout: Option<Duration>,
-    pub headers: HeaderMap,
+    /// Extra HTTP headers sent with every request, as name/value pairs.
+    /// Invalid names or values are reported when the client connects.
+    pub headers: Vec<(String, String)>,
+}
+
+impl std::fmt::Debug for QuackClientOptions {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("QuackClientOptions")
+            .field(
+                "auth_token",
+                &self.auth_token.as_ref().map(|_| "<redacted>"),
+            )
+            .field("client_duckdb_version", &self.client_duckdb_version)
+            .field("client_platform", &self.client_platform)
+            .field(
+                "min_supported_quack_version",
+                &self.min_supported_quack_version,
+            )
+            .field(
+                "max_supported_quack_version",
+                &self.max_supported_quack_version,
+            )
+            .field("client_id", &self.client_id)
+            .field("heartbeat_timeout", &self.heartbeat_timeout)
+            .field("ssl", &self.ssl)
+            .field("timeout", &self.timeout)
+            .field("headers", &self.headers)
+            .finish()
+    }
 }
 
 impl Default for QuackClientOptions {
@@ -61,7 +93,7 @@ impl Default for QuackClientOptions {
             heartbeat_timeout: Some(Duration::from_secs(DEFAULT_HEARTBEAT_TIMEOUT_SECS)),
             ssl: None,
             timeout: Some(DEFAULT_QUACK_REQUEST_TIMEOUT),
-            headers: HeaderMap::new(),
+            headers: Vec::new(),
         }
     }
 }
@@ -85,7 +117,10 @@ pub struct QuackResultStream {
 }
 
 impl QuackResultStream {
-    fn new(columns: Vec<ColumnDefinition>, chunks: BoxStream<'static, Result<DataChunk>>) -> Self {
+    pub(crate) fn new(
+        columns: Vec<ColumnDefinition>,
+        chunks: BoxStream<'static, Result<DataChunk>>,
+    ) -> Self {
         Self {
             columns,
             inner: chunks,
@@ -111,6 +146,45 @@ impl QuackResultStream {
             .boxed();
         (self.columns, rows)
     }
+
+    // Consuming helpers shared by `QuackClient` and `QuackPool`; all of them
+    // drain the stream, which releases the connection.
+    pub(crate) async fn drain(self) -> Result<()> {
+        let (_, mut chunks) = self.into_chunks();
+        while chunks.try_next().await?.is_some() {}
+        Ok(())
+    }
+
+    pub(crate) async fn first_row(self) -> Result<Option<Row>> {
+        let (_, rows) = self.into_rows();
+        let rows: Vec<_> = rows.try_collect().await?;
+        Ok(rows.into_iter().next())
+    }
+
+    pub(crate) async fn one_row(self) -> Result<Row> {
+        let (_, rows) = self.into_rows();
+        let rows: Vec<_> = rows.try_collect().await?;
+        if rows.len() != 1 {
+            return Err(QuackError::protocol(format!(
+                "expected exactly one row, got {}",
+                rows.len()
+            )));
+        }
+        Ok(rows.into_iter().next().expect("one row"))
+    }
+
+    pub(crate) async fn first_column(self) -> Result<Vec<Value>> {
+        let (columns, rows) = self.into_rows();
+        let rows: Vec<_> = rows.try_collect().await?;
+        let first_name = match columns.first() {
+            Some(col) => &col.name,
+            None => return Ok(Vec::new()),
+        };
+        Ok(rows
+            .into_iter()
+            .map(|mut row| row.shift_remove(first_name).unwrap_or(Value::Null))
+            .collect())
+    }
 }
 
 struct FetchState {
@@ -124,25 +198,33 @@ struct FetchState {
     ack_index: u64,
 }
 
+/// One session on a Quack server.
+///
+/// A `QuackClient` maps to exactly one server-side connection id for its whole
+/// lifetime, clones included - they share one `Arc`. That has two
+/// consequences:
+///
+/// - **Queries are serialized.** The server keeps one resumable result cursor
+///   per connection id, and a PREPARE resets it, which would invalidate a FETCH
+///   still in flight. Queries therefore take a mutex, and a result stream holds
+///   it until the stream is drained or dropped. Cloning the client does not
+///   change this: concurrent queries need [`QuackPool`](crate::QuackPool),
+///   which spreads them over several sessions.
+/// - **Session state persists.** Temporary tables, `SET`, transactions, and
+///   attached databases live on the connection, so consecutive calls on one
+///   client see each other's effects.
+///
+/// Dropping the last clone closes the server-side session on a background
+/// task, best-effort; [`disconnect`](Self::disconnect) closes it
+/// deterministically and reports whether that worked.
 #[derive(Clone, Debug)]
 pub struct QuackClient {
-    // Holds connection to Quack server.
-    //
-    // Server holds a resumable cursor for result-streaming per unique
-    // connection_id, and a `QuackClient` (its clones included, since they
-    // share this `Arc`) maps to exactly one connection_id for its whole
-    // lifetime. A concurrent PREPARE (e.g. from another query on this
-    // connection_id) resets the cursor, invalidating a FETCH still in
-    // progress. Connection is wrapped in Mutex to ensure queries are
-    // executed serially on server.
-    //
-    // TODO: support concurrent queries to quack server by introducing
-    // a connection pool
-    //
-    // TODO: close message is not issued to Quack server when `Connection` is
-    // dropped. Server retains the cursor for the dropped connection_id.
     connection: Arc<Mutex<Connection>>,
+    // Also held by the `Connection` itself, so status stays readable while a
+    // result stream holds the mutex.
     state: Arc<ConnectionState>,
+    // Protocol v3 leases expire without heartbeats; the guard's task stops when
+    // the last clone of this client is dropped.
     _heartbeat: Option<Arc<HeartbeatGuard>>,
     pub info: Option<QuackConnectionInfo>,
 }
@@ -175,9 +257,15 @@ impl QuackClient {
         !self.state.is_closed()
     }
 
+    // Whether a pool may hand this connection to the next caller: still open,
+    // and no wire failure has been seen on it.
+    pub(crate) fn is_reusable(&self) -> bool {
+        self.state.is_reusable()
+    }
+
+    /// Run a statement and discard its result.
     pub async fn execute(&self, sql: &str, metadata: Option<&QueryMetadata>) -> Result<()> {
-        let (_, chunks) = self.query_inner(sql, None, metadata).await?.into_chunks();
-        chunks.try_for_each(|_| async { Ok(()) }).await
+        self.query_inner(sql, None, metadata).await?.drain().await
     }
 
     pub async fn query(
@@ -198,7 +286,7 @@ impl QuackClient {
 
     // Execute a SQL query on Quack server and stream results via repeated
     // FETCH calls to server.
-    async fn query_inner(
+    pub(crate) async fn query_inner(
         &self,
         sql: &str,
         params: Option<&SqlParameters>,
@@ -246,7 +334,7 @@ impl QuackClient {
                     result_uuid,
                 ),
                 other => {
-                    return Err(QuackError::protocol(format!(
+                    return Err(connection.protocol_failure(format!(
                         "expected PREPARE_RESPONSE, got {:?}",
                         other.message_type()
                     )));
@@ -316,7 +404,7 @@ impl QuackClient {
                         batch_index,
                         ..
                     } => (results, total_batches, batch_index),
-                    other => Err(QuackError::protocol(format!(
+                    other => Err(connection.protocol_failure(format!(
                         "expected FETCH_RESPONSE, got {:?}",
                         other.message_type()
                     )))?,
@@ -326,31 +414,31 @@ impl QuackClient {
                     match batch_index {
                         Some(batch_index) if batch_index == next_batch_index => {
                             if results.is_empty() {
-                                Err(QuackError::protocol(
+                                Err(connection.protocol_failure(
                                     "FETCH_RESPONSE batch did not include any chunks",
                                 ))?;
                             }
                             ack_index = batch_index;
                             next_batch_index = next_batch_index.checked_add(1).ok_or_else(|| {
-                                QuackError::protocol("FETCH_RESPONSE batch index overflow")
+                                connection.protocol_failure("FETCH_RESPONSE batch index overflow")
                             })?;
                         }
                         // A v3 FETCH_REQUEST asks for one exact batch. The server may produce
                         // batches out of order internally, but it must answer with the requested
                         // index; accepting another index here would silently reorder the result.
-                        Some(batch_index) => Err(QuackError::protocol(format!(
+                        Some(batch_index) => Err(connection.protocol_failure(format!(
                             "expected FETCH_RESPONSE batch {next_batch_index}, got {batch_index}"
                         )))?,
                         None if results.is_empty() => {
                             if let Some(total_batches) = total_batches {
                                 if total_batches != ack_index {
-                                    Err(QuackError::protocol(format!(
+                                    Err(connection.protocol_failure(format!(
                                         "FETCH_RESPONSE ended after {ack_index} batches but announced {total_batches}"
                                     )))?;
                                 }
                             }
                         }
-                        None => Err(QuackError::protocol(
+                        None => Err(connection.protocol_failure(
                             "FETCH_RESPONSE with chunks did not include a batch index",
                         ))?,
                     }
@@ -392,37 +480,15 @@ impl QuackClient {
     }
 
     pub async fn first(&self, sql: &str) -> Result<Option<Row>> {
-        let (_, rows) = self.query(sql, None).await?.into_rows();
-        let rows: Vec<_> = rows.try_collect().await?;
-
-        Ok(rows.into_iter().next())
+        self.query(sql, None).await?.first_row().await
     }
 
     pub async fn one(&self, sql: &str) -> Result<Row> {
-        let (_, rows) = self.query(sql, None).await?.into_rows();
-        let rows: Vec<_> = rows.try_collect().await?;
-
-        if rows.len() != 1 {
-            return Err(QuackError::protocol(format!(
-                "expected exactly one row, got {}",
-                rows.len()
-            )));
-        }
-        Ok(rows.into_iter().next().expect("one row"))
+        self.query(sql, None).await?.one_row().await
     }
 
     pub async fn values(&self, sql: &str) -> Result<Vec<Value>> {
-        let (columns, rows) = self.query(sql, None).await?.into_rows();
-        let rows: Vec<_> = rows.try_collect().await?;
-
-        let first_name = match columns.first() {
-            Some(col) => &col.name,
-            None => return Ok(Vec::new()),
-        };
-        Ok(rows
-            .into_iter()
-            .map(|mut row| row.shift_remove(first_name).unwrap_or(Value::Null))
-            .collect())
+        self.query(sql, None).await?.first_column().await
     }
 
     pub async fn append(
@@ -465,6 +531,13 @@ impl QuackClient {
         Ok(())
     }
 
+    /// Close the server-side session, releasing its cursor and session state.
+    ///
+    /// Waits for any in-flight query to finish, since it takes the same lock.
+    /// Dropping the client does the same thing on a detached task, but a
+    /// detached task only runs while the Tokio runtime is alive; call this when
+    /// the session must be closed before the program moves on, and to see
+    /// whether closing succeeded.
     pub async fn disconnect(&self) -> Result<()> {
         self.connection.lock().await.disconnect().await
     }
@@ -522,7 +595,7 @@ impl Connection {
         let transport = Transport {
             base_url,
             http,
-            headers: options.headers.clone(),
+            headers: header_map(&options.headers)?,
             timeout,
         };
 
@@ -624,10 +697,21 @@ impl Connection {
         }))
     }
 
+    // Records wire failures against the session before returning them, so a
+    // pool can retire the connection instead of handing it on.
     async fn send(&self, message: &QuackMessage) -> Result<QuackMessage> {
-        let response = self.transport.send(message, self.quack_version).await?;
-        self.state.record_success();
-        Ok(response)
+        match self.transport.send(message, self.quack_version).await {
+            Ok(response) => {
+                self.state.record_success();
+                Ok(response)
+            }
+            Err(err) => {
+                if err.is_connection_fatal() {
+                    self.state.degrade();
+                }
+                Err(err)
+            }
+        }
     }
 
     async fn prepare(&self, sql: &str) -> Result<QuackMessage> {
@@ -679,7 +763,8 @@ impl Connection {
             table_name,
             append_chunk: chunk,
         };
-        expect_success(self.send(&message).await?)
+        let response = self.send(&message).await?;
+        self.expect_success(response)
     }
 
     async fn disconnect(&self) -> Result<()> {
@@ -690,9 +775,27 @@ impl Connection {
             header: self.scoped_header(MessageType::DisconnectMessage),
         };
         let response = self.send(&message).await?;
-        expect_success(response)?;
+        self.expect_success(response)?;
         self.state.close();
         Ok(())
+    }
+
+    fn expect_success(&self, response: QuackMessage) -> Result<()> {
+        match response {
+            QuackMessage::SuccessResponse { .. } => Ok(()),
+            other => Err(self.protocol_failure(format!(
+                "expected SUCCESS_RESPONSE, got {:?}",
+                other.message_type()
+            ))),
+        }
+    }
+
+    // A response that decoded but does not fit the protocol: the wrong message
+    // type, or inconsistent batch metadata. The session's state is unknown
+    // afterwards, so it is retired the way a transport failure is.
+    fn protocol_failure(&self, message: impl Into<String>) -> QuackError {
+        self.state.degrade();
+        QuackError::protocol(message)
     }
 
     fn scoped_header(&self, message_type: MessageType) -> MessageHeader {
@@ -711,6 +814,46 @@ impl Connection {
     }
 }
 
+// Best-effort session cleanup: without a DISCONNECT the server keeps the
+// session - and its result cursor - for the connection id we are about to
+// forget. `Drop` cannot await, so the message goes out on a detached task,
+// which means it is delivered only while the Tokio runtime outlives the drop.
+// `QuackClient::disconnect` remains the deterministic path.
+impl Drop for Connection {
+    fn drop(&mut self) {
+        if self.state.is_closed() {
+            return;
+        }
+        let connection_id = self.connection_id.clone();
+        let Ok(runtime) = tokio::runtime::Handle::try_current() else {
+            tracing::debug!(
+                connection_id,
+                "quack session dropped outside a Tokio runtime; server session left open"
+            );
+            return;
+        };
+        let message = QuackMessage::Disconnect {
+            header: self.scoped_header(MessageType::DisconnectMessage),
+        };
+        let quack_version = self.quack_version;
+        let mut transport = self.transport.clone();
+        transport.timeout = transport.timeout.min(DISCONNECT_ON_DROP_TIMEOUT);
+        runtime.spawn(async move {
+            match transport.send(&message, quack_version).await {
+                Ok(_) => tracing::debug!(connection_id, "quack session closed on drop"),
+                Err(err) => tracing::debug!(
+                    connection_id,
+                    %err,
+                    "quack DISCONNECT on drop failed; server session left open"
+                ),
+            }
+        });
+    }
+}
+
+// Everything needed to talk to the server, minus the session. Cheap to clone -
+// `reqwest::Client` is itself a handle - so a dropped connection can hand it to
+// the background task that sends its DISCONNECT.
 #[derive(Clone, Debug)]
 struct Transport {
     base_url: String,
@@ -801,9 +944,14 @@ impl HeartbeatGuard {
     }
 }
 
+// Connection status, shared with the owning `QuackClient` so it can be read
+// without taking the connection mutex.
 #[derive(Debug)]
 struct ConnectionState {
     lease: StdMutex<ConnectionLease>,
+    // A wire failure was seen on this session. It may still be open on the
+    // server, but a pool should not hand it to the next caller.
+    degraded: AtomicBool,
 }
 
 #[derive(Debug)]
@@ -823,6 +971,7 @@ impl ConnectionState {
                 last_successful_activity: now,
                 closed: false,
             }),
+            degraded: AtomicBool::new(false),
         }
     }
 
@@ -858,6 +1007,14 @@ impl ConnectionState {
         self.lease().closed
     }
 
+    fn degrade(&self) {
+        self.degraded.store(true, Ordering::Relaxed);
+    }
+
+    fn is_reusable(&self) -> bool {
+        !self.is_closed() && !self.degraded.load(Ordering::Relaxed)
+    }
+
     fn lease(&self) -> std::sync::MutexGuard<'_, ConnectionLease> {
         self.lease
             .lock()
@@ -869,6 +1026,18 @@ impl Drop for HeartbeatGuard {
     fn drop(&mut self) {
         self.task.abort();
     }
+}
+
+fn header_map(headers: &[(String, String)]) -> Result<HeaderMap> {
+    let mut map = HeaderMap::with_capacity(headers.len());
+    for (name, value) in headers {
+        let name = HeaderName::try_from(name.as_str())
+            .map_err(|_| QuackError::protocol(format!("invalid HTTP header name {name}")))?;
+        let value = HeaderValue::from_str(value)
+            .map_err(|_| QuackError::protocol(format!("invalid value for HTTP header {name}")))?;
+        map.append(name, value);
+    }
+    Ok(map)
 }
 
 fn validate_heartbeat_timeout(seconds: u64) -> Result<()> {
@@ -997,19 +1166,67 @@ fn attach_column_names(chunks: &mut [DataChunk], names: &[String]) {
     }
 }
 
-fn expect_success(response: QuackMessage) -> Result<()> {
-    match response {
-        QuackMessage::SuccessResponse { .. } => Ok(()),
-        other => Err(QuackError::protocol(format!(
-            "expected SUCCESS_RESPONSE, got {:?}",
-            other.message_type()
-        ))),
-    }
-}
-
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    // A connection whose session was never negotiated: enough to exercise
+    // `Drop`, the one path here that runs without a Quack server.
+    fn test_connection(base_url: &str) -> Connection {
+        Connection {
+            transport: Transport {
+                base_url: base_url.to_string(),
+                http: reqwest::Client::new(),
+                headers: HeaderMap::new(),
+                timeout: Duration::from_millis(500),
+            },
+            connection_id: "test-connection".to_string(),
+            quack_version: QUACK_V1,
+            query_counter: AtomicU64::new(1),
+            query_uuid_counter: AtomicU64::new(1),
+            state: Arc::new(ConnectionState::new()),
+        }
+    }
+
+    // A socket that reports whether anything tried to reach it, so the
+    // background DISCONNECT can be observed without a Quack server.
+    fn listening_socket() -> (std::net::TcpListener, String) {
+        let listener = std::net::TcpListener::bind("127.0.0.1:0").expect("bind");
+        listener.set_nonblocking(true).expect("nonblocking");
+        let base_url = format!("http://{}", listener.local_addr().expect("addr"));
+        (listener, base_url)
+    }
+
+    async fn connected_within(listener: &std::net::TcpListener, window: Duration) -> bool {
+        let deadline = Instant::now() + window;
+        while Instant::now() < deadline {
+            match listener.accept() {
+                Ok(_) => return true,
+                Err(err) if err.kind() == std::io::ErrorKind::WouldBlock => {
+                    tokio::time::sleep(Duration::from_millis(10)).await;
+                }
+                Err(err) => panic!("accept failed: {err}"),
+            }
+        }
+        false
+    }
+
+    #[test]
+    fn debug_output_redacts_the_auth_token() {
+        let options = QuackClientOptions {
+            auth_token: Some("super_secret".to_string()),
+            client_id: Some("visible".to_string()),
+            ..Default::default()
+        };
+        let rendered = format!("{options:?}");
+        assert!(!rendered.contains("super_secret"), "{rendered}");
+        assert!(rendered.contains("<redacted>"), "{rendered}");
+        assert!(rendered.contains("visible"), "{rendered}");
+        assert!(
+            format!("{:?}", QuackClientOptions::default()).contains("auth_token: None"),
+            "an absent token is shown as absent"
+        );
+    }
 
     #[test]
     fn default_options_have_request_timeout() {
@@ -1017,6 +1234,19 @@ mod tests {
             QuackClientOptions::default().timeout,
             Some(DEFAULT_QUACK_REQUEST_TIMEOUT)
         );
+    }
+
+    #[test]
+    fn header_pairs_are_converted_and_validated() {
+        let map = header_map(&[
+            ("x-trace".to_string(), "abc".to_string()),
+            ("x-trace".to_string(), "def".to_string()),
+        ])
+        .expect("valid headers");
+        assert_eq!(map.get_all("x-trace").iter().count(), 2);
+
+        assert!(header_map(&[("bad name".to_string(), "value".to_string())]).is_err());
+        assert!(header_map(&[("x-trace".to_string(), "bad\nvalue".to_string())]).is_err());
     }
 
     #[test]
@@ -1039,5 +1269,56 @@ mod tests {
         assert!(!state.close_if_expired_at(started + Duration::from_secs(58), timeout));
         assert!(state.close_if_expired_at(started + Duration::from_secs(59), timeout));
         assert!(state.is_closed());
+    }
+
+    #[test]
+    fn a_degraded_connection_is_not_reusable() {
+        let state = ConnectionState::new();
+        assert!(state.is_reusable());
+        state.degrade();
+        assert!(!state.is_reusable());
+        assert!(!state.is_closed(), "degraded is not the same as closed");
+    }
+
+    #[tokio::test]
+    async fn dropping_an_open_connection_sends_a_disconnect() {
+        let (listener, base_url) = listening_socket();
+        drop(test_connection(&base_url));
+        assert!(
+            connected_within(&listener, Duration::from_secs(5)).await,
+            "dropping an open session should send a DISCONNECT"
+        );
+    }
+
+    #[tokio::test]
+    async fn dropping_a_closed_connection_sends_nothing() {
+        let (listener, base_url) = listening_socket();
+        let connection = test_connection(&base_url);
+        connection.state.close();
+        drop(connection);
+        assert!(
+            !connected_within(&listener, Duration::from_millis(300)).await,
+            "a disconnected session should not be closed twice"
+        );
+    }
+
+    #[test]
+    fn dropping_a_connection_without_a_runtime_is_harmless() {
+        // Nothing to spawn the DISCONNECT on, so it is skipped rather than
+        // taking the caller down with it.
+        drop(test_connection("http://127.0.0.1:1"));
+    }
+
+    #[test]
+    fn dropping_a_connection_as_the_runtime_shuts_down_is_harmless() {
+        let runtime = tokio::runtime::Runtime::new().expect("runtime");
+        let connection = test_connection("http://127.0.0.1:1");
+        runtime.spawn(async move {
+            let _connection = connection;
+            std::future::pending::<()>().await;
+        });
+        // Cancels the task, so the connection is dropped from inside a runtime
+        // that is already going away.
+        drop(runtime);
     }
 }
