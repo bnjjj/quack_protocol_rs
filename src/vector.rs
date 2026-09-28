@@ -4,6 +4,7 @@ use crate::binary::{
     BinaryReader, BinaryWriter, HugeIntParts, combine_signed_huge_int, combine_unsigned_huge_int,
     split_signed_huge_int,
 };
+use crate::constants::OPTIONAL_INDEX_INVALID;
 use crate::errors::{QuackError, Result};
 use crate::logical_types::{
     ExtraTypeInfo, LogicalType, LogicalTypeId, PhysicalType, decode_logical_type,
@@ -448,9 +449,7 @@ fn decode_flat_vector_body(
 
     match physical_type {
         PhysicalType::Varchar => {
-            let raw_values = reader.read_required_field(102, |reader| {
-                reader.read_list(|reader, _| reader.read_string_bytes())
-            })?;
+            let raw_values = read_string_vector_data(reader, count, validity.as_deref())?;
             let values = raw_values
                 .into_iter()
                 .enumerate()
@@ -611,6 +610,69 @@ fn encode_flat_vector_body(
             "cannot encode physical type {other:?}"
         ))),
     }
+}
+
+/// Reads the payload of a string-like vector.
+///
+/// DuckDB has two layouts. From storage version 2.0, which the Quack server
+/// uses on DuckDB 2.0, a vector carries the byte length of its string data
+/// (field 107), a little-endian `u32` length for every row (108), and the bytes
+/// of the valid rows back to back (109). Older servers send a list of strings
+/// (102). Invalid rows are empty either way; the caller masks them.
+fn read_string_vector_data(
+    reader: &mut BinaryReader<'_>,
+    count: usize,
+    validity: Option<&[bool]>,
+) -> Result<Vec<Vec<u8>>> {
+    let byte_data_length = reader
+        .read_optional_field(107, |reader| reader.read_uleb_u64().map(Some), None)?
+        .filter(|length| *length != OPTIONAL_INDEX_INVALID);
+    let Some(byte_data_length) = byte_data_length else {
+        return reader.read_required_field(102, |reader| {
+            reader.read_list(|reader, _| reader.read_string_bytes())
+        });
+    };
+
+    let length_data = reader.read_required_field(108, |reader| reader.read_blob())?;
+    let byte_data = reader.read_required_field(109, |reader| reader.read_blob())?;
+    if length_data.len() != count * size_of::<u32>() {
+        return Err(QuackError::protocol(format!(
+            "string vector has {} bytes of lengths, expected {} for {count} rows",
+            length_data.len(),
+            count * size_of::<u32>()
+        )));
+    }
+    if byte_data.len() as u64 != byte_data_length {
+        return Err(QuackError::protocol(format!(
+            "string vector has {} bytes of data, header declares {byte_data_length}",
+            byte_data.len()
+        )));
+    }
+
+    let mut offset = 0;
+    let mut values = Vec::with_capacity(count);
+    for (index, length) in length_data.chunks_exact(size_of::<u32>()).enumerate() {
+        if !is_valid(validity, index) {
+            values.push(Vec::new());
+            continue;
+        }
+        let length = u32::from_le_bytes([length[0], length[1], length[2], length[3]]) as usize;
+        let value = byte_data.get(offset..offset + length).ok_or_else(|| {
+            QuackError::protocol(format!(
+                "string {index} of {length} bytes overruns the vector's {} bytes of data",
+                byte_data.len()
+            ))
+        })?;
+        values.push(value.to_vec());
+        offset += length;
+    }
+    if offset != byte_data.len() {
+        return Err(QuackError::protocol(format!(
+            "string vector uses {offset} of its {} bytes of data",
+            byte_data.len()
+        )));
+    }
+    Ok(values)
 }
 
 fn decode_fixed_values(
@@ -1205,5 +1267,89 @@ fn value_to_string_lossy(value: &Value) -> String {
         Value::Timestamp(value) => value.value.to_string(),
         Value::Interval(value) => format!("{} {} {}", value.months, value.days, value.micros),
         Value::List(_) | Value::Struct(_) => String::new(),
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::logical_types::LogicalTypes;
+
+    /// A flat string vector in DuckDB's storage version 2.0 layout.
+    fn v2_string_vector(values: &[Option<&[u8]>], byte_data_length: Option<u64>) -> Vec<u8> {
+        let validity: Vec<bool> = values.iter().map(Option::is_some).collect();
+        let lengths: Vec<u8> = values
+            .iter()
+            .flat_map(|value| (value.map_or(0, <[u8]>::len) as u32).to_le_bytes())
+            .collect();
+        let bytes: Vec<u8> = values.iter().flatten().flat_map(|v| v.to_vec()).collect();
+        let mut writer = BinaryWriter::new();
+        writer
+            .write_object(|object| {
+                let has_validity_mask = validity.iter().any(|valid| !valid);
+                object.write_field(100, |object| object.write_bool(has_validity_mask))?;
+                if has_validity_mask {
+                    object.write_field(101, |object| {
+                        object.write_blob(&write_validity_mask(&validity))
+                    })?;
+                }
+                object.write_field(107, |object| {
+                    object.write_uleb(byte_data_length.unwrap_or(bytes.len() as u64))
+                })?;
+                object.write_field(108, |object| object.write_blob(&lengths))?;
+                object.write_field(109, |object| object.write_blob(&bytes))
+            })
+            .unwrap();
+        writer.into_bytes()
+    }
+
+    fn decode(bytes: &[u8], logical_type: &LogicalType, count: usize) -> Result<Vec<Value>> {
+        let mut reader = BinaryReader::new(bytes);
+        let vector = decode_vector(&mut reader, logical_type, count)?;
+        reader.assert_eof()?;
+        Ok(vector.values)
+    }
+
+    #[test]
+    fn decodes_v2_string_vector_with_nulls_and_empty_strings() {
+        let bytes = v2_string_vector(&[Some(b"ab"), None, Some(b""), Some(b"cde")], None);
+        assert_eq!(
+            decode(&bytes, &LogicalTypes::varchar(), 4).unwrap(),
+            vec![
+                Value::String("ab".into()),
+                Value::Null,
+                Value::String(String::new()),
+                Value::String("cde".into()),
+            ]
+        );
+    }
+
+    #[test]
+    fn decodes_v2_blob_vector_as_bytes() {
+        let bytes = v2_string_vector(&[Some(&[0, 159, 146, 150])], None);
+        assert_eq!(
+            decode(&bytes, &LogicalTypes::blob(), 1).unwrap(),
+            vec![Value::Bytes(vec![0, 159, 146, 150])]
+        );
+    }
+
+    #[test]
+    fn still_decodes_list_string_vector() {
+        let values = vec![Value::String("x".into()), Value::Null];
+        let mut writer = BinaryWriter::new();
+        encode_vector(&mut writer, &LogicalTypes::varchar(), &values, 2).unwrap();
+        assert_eq!(
+            decode(&writer.into_bytes(), &LogicalTypes::varchar(), 2).unwrap(),
+            values
+        );
+    }
+
+    #[test]
+    fn rejects_v2_string_vector_whose_lengths_disagree_with_its_data() {
+        let bytes = v2_string_vector(&[Some(b"ab")], Some(3));
+        assert!(decode(&bytes, &LogicalTypes::varchar(), 1).is_err());
+        // Two rows declared, one row of lengths sent.
+        let bytes = v2_string_vector(&[Some(b"ab")], None);
+        assert!(decode(&bytes, &LogicalTypes::varchar(), 2).is_err());
     }
 }

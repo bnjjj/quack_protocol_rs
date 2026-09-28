@@ -682,3 +682,46 @@ fn converts_quack_values_to_json() {
         serde_json::json!("1970-01-01T00:00:01.234567Z")
     );
 }
+
+#[test]
+fn decodes_error_response_with_exception_type_and_extra_info() {
+    // An ERROR_RESPONSE as DuckDB 2.0 servers send it: the message followed by
+    // exception_type (2), extra_info (3) and must_invalidate (4).
+    let mut writer = binary::BinaryWriter::new();
+    crate::messages::encode_header(
+        &mut writer,
+        &MessageHeader {
+            message_type: MessageType::ErrorResponse,
+            connection_id: some_name("conn"),
+            client_query_id: None,
+        },
+    )
+    .unwrap();
+    writer
+        .write_object(|object| {
+            object.write_field(1, |object| {
+                object.write_string("Catalog Error: Table with name t does not exist!")
+            })?;
+            object.write_field(2, |object| object.write_string("Catalog"))?;
+            object.write_field(3, |object| {
+                object.write_list(
+                    &[("name", "t"), ("type", "Table")],
+                    |entry, (key, value), _| {
+                        entry.write_object(|entry| {
+                            entry.write_field(0, |entry| entry.write_string(key))?;
+                            entry.write_field(1, |entry| entry.write_string(value))
+                        })
+                    },
+                )
+            })?;
+            object.write_field(4, |object| object.write_bool(true))
+        })
+        .unwrap();
+
+    match decode_message_for_version(&writer.into_bytes(), QUACK_V3).unwrap() {
+        QuackMessage::ErrorResponse { message, .. } => {
+            assert_eq!(message, "Catalog Error: Table with name t does not exist!")
+        }
+        other => panic!("expected ERROR_RESPONSE, got {other:?}"),
+    }
+}
