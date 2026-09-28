@@ -742,6 +742,8 @@ dependencies = [
  "futures-util",
  "indexmap",
  "reqwest",
+ "ring",
+ "rustls",
  "serde_json",
  "thiserror",
  "tokio",
