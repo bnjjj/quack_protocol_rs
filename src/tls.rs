@@ -4,6 +4,7 @@ use rustls::client::danger::{HandshakeSignatureValid, ServerCertVerified, Server
 use rustls::crypto::{CryptoProvider, verify_tls13_signature_with_raw_key};
 use rustls::pki_types::{CertificateDer, ServerName, SubjectPublicKeyInfoDer, UnixTime};
 use rustls::{ClientConfig, DigitallySignedStruct, SignatureScheme};
+use x509_parser::prelude::{FromDer, X509Certificate};
 
 use crate::errors::{QuackError, Result};
 
@@ -23,26 +24,14 @@ impl CertificatePin {
             Some(prefix) if prefix.eq_ignore_ascii_case("sha256:") => &trimmed[7..],
             _ => trimmed,
         };
-        let mut nibbles = Vec::with_capacity(SHA256_LEN * 2);
-        for c in digits.chars().filter(|c| *c != ':' && *c != ' ') {
-            let nibble = c.to_digit(16).ok_or_else(|| {
-                QuackError::protocol(format!(
-                    "invalid ssl_fingerprint {fingerprint:?}: expected the SHA-256 fingerprint \
-                     of the server certificate as hex digits, optionally separated by colons"
-                ))
-            })?;
-            nibbles.push(nibble as u8);
-        }
-        if nibbles.len() != SHA256_LEN * 2 {
-            return Err(QuackError::protocol(format!(
-                "invalid ssl_fingerprint {fingerprint:?}: a SHA-256 fingerprint has 64 hex digits, got {}",
-                nibbles.len()
-            )));
-        }
+        let digits: String = digits.chars().filter(|c| !matches!(c, ':' | ' ')).collect();
         let mut bytes = [0; SHA256_LEN];
-        for (byte, pair) in bytes.iter_mut().zip(nibbles.chunks_exact(2)) {
-            *byte = (pair[0] << 4) | pair[1];
-        }
+        hex::decode_to_slice(&digits, &mut bytes).map_err(|err| {
+            QuackError::protocol(format!(
+                "invalid ssl_fingerprint {fingerprint:?}: expected the 64 hex digits of the \
+                 server certificate's SHA-256 fingerprint, optionally separated by colons ({err})"
+            ))
+        })?;
         Ok(Self(bytes))
     }
 
@@ -139,86 +128,130 @@ impl ServerCertVerifier for PinnedCertVerifier {
 }
 
 /// The DER-encoded `subjectPublicKeyInfo` of an X.509 certificate of any
-/// version, or `None` if `certificate` is not well-formed DER of that shape.
+/// version, or `None` if `certificate` is not exactly one well-formed
+/// certificate.
 fn subject_public_key_info(certificate: &[u8]) -> Option<&[u8]> {
-    const SEQUENCE: u8 = 0x30;
-    const VERSION: u8 = 0xa0; // [0] EXPLICIT, present from v2 on
-
-    let (certificate, _) = der_element(certificate, SEQUENCE)?;
-    let (mut tbs, _) = der_element(certificate.contents, SEQUENCE)?;
-    if tbs.contents.first() == Some(&VERSION) {
-        tbs.contents = der_element(tbs.contents, VERSION)?.1;
-    }
-    // serialNumber, signature, issuer, validity, subject
-    let mut rest = tbs.contents;
-    for _ in 0..5 {
-        rest = der_any(rest)?.1;
-    }
-    let (spki, _) = der_element(rest, SEQUENCE)?;
-    Some(spki.encoded)
-}
-
-struct DerElement<'a> {
-    encoded: &'a [u8],
-    contents: &'a [u8],
-}
-
-fn der_element(input: &[u8], tag: u8) -> Option<(DerElement<'_>, &[u8])> {
-    match der_any(input)? {
-        (element, rest) if input[0] == tag => Some((element, rest)),
+    match X509Certificate::from_der(certificate) {
+        Ok(([], certificate)) => Some(certificate.tbs_certificate.subject_pki.raw),
         _ => None,
     }
 }
 
-/// Splits the first DER element (single-byte tag, definite length) off `input`.
-fn der_any(input: &[u8]) -> Option<(DerElement<'_>, &[u8])> {
-    let first_length_byte = *input.get(1)?;
-    let (length, header) = if first_length_byte < 0x80 {
-        (usize::from(first_length_byte), 2)
-    } else {
-        let count = usize::from(first_length_byte & 0x7f);
-        if count == 0 || count > std::mem::size_of::<usize>() {
-            return None;
+/// A local HTTPS server for handshake tests, and certificates to serve.
+#[cfg(test)]
+pub(crate) mod test_server {
+    use std::sync::Arc;
+
+    use rustls::ServerConfig;
+    use rustls::pki_types::{CertificateDer, PrivateKeyDer, PrivatePkcs8KeyDer};
+    use rustls::server::{ClientHello, ResolvesServerCert};
+    use rustls::sign::CertifiedKey;
+    use tokio::io::{AsyncReadExt, AsyncWriteExt};
+    use tokio::net::TcpListener;
+    use tokio_rustls::TlsAcceptor;
+
+    // Two self-signed certificates for one P-256 key: an X.509 v1 certificate,
+    // the version `quack_generate_keys()` produces, and a v3 one from
+    // `openssl req -x509`. The fingerprints are what
+    // `openssl x509 -noout -fingerprint -sha256` prints for them.
+    pub(crate) const V1_CERT: &[u8] = include_bytes!("../testdata/tls/v1-cert.der");
+    pub(crate) const V1_CERT_FINGERPRINT: &str = "01:50:96:0A:D8:17:B9:61:A1:A9:08:AB:4A:96:D0:A0:10:C3:02:87:B1:DB:AC:EE:33:92:4F:15:C1:2B:53:B1";
+    pub(crate) const V3_CERT: &[u8] = include_bytes!("../testdata/tls/v3-cert.der");
+    pub(crate) const V3_CERT_FINGERPRINT: &str = "A5:B7:18:96:27:21:76:41:25:8E:6E:68:0E:1E:DF:F5:31:23:F0:45:CA:44:69:82:9A:86:42:EE:C6:5E:05:33";
+    // The PKCS#8 private key both certificates are issued for.
+    const KEY: &[u8] = include_bytes!("../testdata/tls/key.der");
+
+    /// Serves `response`, a raw HTTP/1.1 response, over TLS 1.3 with
+    /// `certificate` to every connection on a local port, and returns the port.
+    pub(crate) async fn serve(certificate: &'static [u8], response: String) -> u16 {
+        let provider = Arc::new(rustls::crypto::ring::default_provider());
+        // Not `with_single_cert`: it checks the key against the certificate
+        // through webpki, which rejects v1 certificates.
+        let key = provider
+            .key_provider
+            .load_private_key(PrivateKeyDer::Pkcs8(PrivatePkcs8KeyDer::from(KEY)))
+            .unwrap();
+        let certified = CertifiedKey::new(vec![CertificateDer::from(certificate)], key);
+        let config = ServerConfig::builder_with_provider(provider)
+            .with_protocol_versions(&[&rustls::version::TLS13])
+            .unwrap()
+            .with_no_client_auth()
+            .with_cert_resolver(Arc::new(SingleCert(Arc::new(certified))));
+        let acceptor = TlsAcceptor::from(Arc::new(config));
+        let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let port = listener.local_addr().unwrap().port();
+        tokio::spawn(async move {
+            while let Ok((stream, _)) = listener.accept().await {
+                let acceptor = acceptor.clone();
+                let response = response.clone();
+                tokio::spawn(async move {
+                    // Handshakes a test expects to fail end here.
+                    let Ok(mut stream) = acceptor.accept(stream).await else {
+                        return;
+                    };
+                    let mut request = Vec::new();
+                    let mut buf = [0; 1024];
+                    // Headers are enough: no test needs the body.
+                    while !request.windows(4).any(|window| window == b"\r\n\r\n") {
+                        match stream.read(&mut buf).await {
+                            Ok(0) | Err(_) => return,
+                            Ok(n) => request.extend_from_slice(&buf[..n]),
+                        }
+                    }
+                    let _ = stream.write_all(response.as_bytes()).await;
+                    let _ = stream.shutdown().await;
+                });
+            }
+        });
+        port
+    }
+
+    #[derive(Debug)]
+    struct SingleCert(Arc<CertifiedKey>);
+
+    impl ResolvesServerCert for SingleCert {
+        fn resolve(&self, _hello: ClientHello<'_>) -> Option<Arc<CertifiedKey>> {
+            Some(Arc::clone(&self.0))
         }
-        let bytes = input.get(2..2 + count)?;
-        let length = bytes
-            .iter()
-            .fold(0usize, |length, byte| (length << 8) | usize::from(*byte));
-        (length, 2 + count)
-    };
-    let end = header.checked_add(length)?;
-    let encoded = input.get(..end)?;
-    Some((
-        DerElement {
-            encoded,
-            contents: &encoded[header..],
-        },
-        &input[end..],
-    ))
+    }
+
+    pub(crate) fn ok_response() -> String {
+        "HTTP/1.1 200 OK\r\ncontent-length: 2\r\nconnection: close\r\n\r\nok".to_string()
+    }
 }
 
 #[cfg(test)]
 mod tests {
-    use base64::Engine;
+    use std::error::Error as _;
 
+    use super::test_server::{self, V1_CERT, V1_CERT_FINGERPRINT, V3_CERT, V3_CERT_FINGERPRINT};
     use super::*;
 
     const FINGERPRINT: &str = "2B:31:F0:0A:9C:44:D1:7E:65:B8:03:FE:12:34:56:78:9A:BC:DE:F0:01:23:45:67:89:AB:CD:EF:10:32:54:EA";
+    // `openssl pkey -pubout -outform der` for the key both test certificates share.
+    const SPKI: &[u8] = include_bytes!("../testdata/tls/spki.der");
 
-    // Two self-signed certificates for one P-256 key: an X.509 v1 certificate,
-    // the version `quack_generate_keys()` produces, and a v3 one from
-    // `openssl req -x509`. The fingerprint is what
-    // `openssl x509 -noout -fingerprint -sha256` prints for the v1 certificate.
-    const V1_CERT: &str = "MIIBDzCBtgIBATAKBggqhkjOPQQDAjAUMRIwEAYDVQQDDAlsb2NhbGhvc3QwHhcNMjYwOTI4MjAxNjA1WhcNMzYwOTI1MjAxNjA1WjAUMRIwEAYDVQQDDAlsb2NhbGhvc3QwWTATBgcqhkjOPQIBBggqhkjOPQMBBwNCAASyjlZ2yGx5cVoj57+B6Ei3GFnNwkPfcD08AMj1fhzLENbu2BZstH9IfD9/LCHvSWgyYW7FcQEKkoARSLQyejMUMAoGCCqGSM49BAMCA0gAMEUCIQD5Zq/uMnCQSCAQ6OZcWh69Csmse3Pt6QjdY8OuiOlYFAIgfJ3tLNVcM0wragKjUsj46LsBM0BIs5QupUdyBb36XhU=";
-    const V1_CERT_FINGERPRINT: &str = "19:4A:13:43:0E:E4:94:23:FB:22:C0:58:60:46:47:BA:26:9D:D7:8B:E4:32:FA:9C:CB:AE:B0:07:12:99:B0:69";
-    const V3_CERT: &str = "MIIBfzCCASWgAwIBAgIUe5A7LGojUu+ZqCF+pUCEUTg6xjUwCgYIKoZIzj0EAwIwFTETMBEGA1UEAwwKcXVhY2stdGVzdDAeFw0yNjA5MjgyMDA5MzRaFw0zNjA5MjUyMDA5MzRaMBUxEzARBgNVBAMMCnF1YWNrLXRlc3QwWTATBgcqhkjOPQIBBggqhkjOPQMBBwNCAASyjlZ2yGx5cVoj57+B6Ei3GFnNwkPfcD08AMj1fhzLENbu2BZstH9IfD9/LCHvSWgyYW7FcQEKkoARSLQyejMUo1MwUTAdBgNVHQ4EFgQUXDIXK/wxf8Lp7wFQgq2CrEyAUhUwHwYDVR0jBBgwFoAUXDIXK/wxf8Lp7wFQgq2CrEyAUhUwDwYDVR0TAQH/BAUwAwEB/zAKBggqhkjOPQQDAgNIADBFAiEA/heK1yWmVEeN+nBZ7k1HHDcBFg8/GdbLNTEC61Lmw5UCIDZKUeneEPpnSR2hO/sUFo+OkBTHaf5Kxa91dyNWmIVV";
-    // `openssl pkey -pubout -outform der` for the key both certificates share.
-    const SPKI: &str = "MFkwEwYHKoZIzj0CAQYIKoZIzj0DAQcDQgAEso5WdshseXFaI+e/gehItxhZzcJD33A9PADI9X4cyxDW7tgWbLR/SHw/fywh70loMmFuxXEBCpKAEUi0MnozFA==";
+    async fn get_pinned(port: u16, fingerprint: &str) -> reqwest::Result<String> {
+        let config = pinned_client_config(CertificatePin::parse(fingerprint).unwrap()).unwrap();
+        reqwest::Client::builder()
+            .use_preconfigured_tls(config)
+            .build()?
+            .get(format!("https://127.0.0.1:{port}/"))
+            .send()
+            .await?
+            .text()
+            .await
+    }
 
-    fn der(base64: &str) -> Vec<u8> {
-        base64::engine::general_purpose::STANDARD
-            .decode(base64)
-            .unwrap()
+    // The error and its sources, which is where reqwest keeps the TLS error.
+    fn error_chain(err: &reqwest::Error) -> String {
+        let mut chain = err.to_string();
+        let mut source = err.source();
+        while let Some(err) = source {
+            chain.push_str(&format!(": {err}"));
+            source = err.source();
+        }
+        chain
     }
 
     #[test]
@@ -261,7 +294,7 @@ mod tests {
 
     #[test]
     fn verifier_accepts_only_the_pinned_certificate() {
-        let cert = CertificateDer::from(der(V1_CERT));
+        let cert = CertificateDer::from(V1_CERT);
         let server_name = ServerName::try_from("quack.example").unwrap();
         let verify = |fingerprint: &str| {
             PinnedCertVerifier {
@@ -278,21 +311,44 @@ mod tests {
 
     #[test]
     fn reads_the_public_key_of_v1_and_v3_certificates() {
-        let spki = der(SPKI);
         for cert in [V1_CERT, V3_CERT] {
-            assert_eq!(
-                subject_public_key_info(&der(cert)),
-                Some(spki.as_slice()),
-                "{cert}"
-            );
+            assert_eq!(subject_public_key_info(cert), Some(SPKI));
         }
     }
 
     #[test]
     fn malformed_certificates_have_no_public_key() {
-        let cert = der(V1_CERT);
         assert_eq!(subject_public_key_info(&[]), None);
-        assert_eq!(subject_public_key_info(&cert[..cert.len() / 2]), None);
-        assert_eq!(subject_public_key_info(&der(SPKI)), None);
+        assert_eq!(subject_public_key_info(&V1_CERT[..V1_CERT.len() / 2]), None);
+        assert_eq!(subject_public_key_info(&[V1_CERT, &[0]].concat()), None);
+        assert_eq!(subject_public_key_info(SPKI), None);
+    }
+
+    #[tokio::test]
+    async fn pinned_handshake_succeeds_with_v1_and_v3_certificates() {
+        for (cert, fingerprint) in [
+            (V1_CERT, V1_CERT_FINGERPRINT),
+            (V3_CERT, V3_CERT_FINGERPRINT),
+        ] {
+            let port = test_server::serve(cert, test_server::ok_response()).await;
+            assert_eq!(
+                get_pinned(port, fingerprint).await.unwrap(),
+                "ok",
+                "{fingerprint}"
+            );
+        }
+    }
+
+    #[tokio::test]
+    async fn pinned_handshake_fails_for_another_certificate() {
+        let port = test_server::serve(V1_CERT, test_server::ok_response()).await;
+        for fingerprint in [FINGERPRINT, V3_CERT_FINGERPRINT] {
+            let err = get_pinned(port, fingerprint).await.unwrap_err();
+            let chain = error_chain(&err);
+            assert!(
+                chain.contains("does not match the pinned ssl_fingerprint"),
+                "{chain}"
+            );
+        }
     }
 }

@@ -262,14 +262,7 @@ impl QuackClient {
             )));
         }
         let timeout = options.timeout.unwrap_or(DEFAULT_QUACK_REQUEST_TIMEOUT);
-        let mut http = reqwest::Client::builder()
-            .connect_timeout(DEFAULT_QUACK_CONNECT_TIMEOUT.min(timeout))
-            .pool_max_idle_per_host(0)
-            .timeout(timeout);
-        if let Some(pin) = pin {
-            http = http.use_preconfigured_tls(pinned_client_config(pin)?);
-        }
-        let http = http.build()?;
+        let http = http_client(parsed.ssl, pin, timeout)?;
         let base_url = parsed.base_url.trim_end_matches('/').to_string();
         let (connection, info) = Connection::connect(base_url, http, timeout, options).await?;
         let state = Arc::clone(&connection.state);
@@ -1095,6 +1088,25 @@ pub(crate) fn is_version_negotiation_error(error: &QuackError) -> bool {
         || message.contains("unexpected field")
 }
 
+// The HTTP client for one session. An HTTPS session stays on HTTPS: a
+// redirect to an `http://` URL is an error rather than a silent downgrade that
+// would send queries, and with a pin skip the pinned certificate, in plaintext.
+fn http_client(
+    ssl: bool,
+    pin: Option<CertificatePin>,
+    timeout: Duration,
+) -> Result<reqwest::Client> {
+    let mut http = reqwest::Client::builder()
+        .connect_timeout(DEFAULT_QUACK_CONNECT_TIMEOUT.min(timeout))
+        .pool_max_idle_per_host(0)
+        .https_only(ssl)
+        .timeout(timeout);
+    if let Some(pin) = pin {
+        http = http.use_preconfigured_tls(pinned_client_config(pin)?);
+    }
+    Ok(http.build()?)
+}
+
 pub(crate) fn parse_quack_uri(input: &str, ssl_override: Option<bool>) -> Result<ParsedQuackUri> {
     let uri = input.trim();
     if uri.is_empty() {
@@ -1241,6 +1253,38 @@ mod tests {
             }
         }
         false
+    }
+
+    #[tokio::test]
+    async fn https_sessions_refuse_redirects_to_http() {
+        use crate::tls::test_server::{self, V1_CERT, V1_CERT_FINGERPRINT};
+
+        let (plain, plain_url) = listening_socket();
+        let port = test_server::serve(
+            V1_CERT,
+            format!(
+                "HTTP/1.1 307 Temporary Redirect\r\nlocation: {plain_url}/\r\n\
+                 content-length: 0\r\nconnection: close\r\n\r\n"
+            ),
+        )
+        .await;
+        let pin = Some(CertificatePin::parse(V1_CERT_FINGERPRINT).unwrap());
+        let post = |ssl| async move {
+            http_client(ssl, pin, Duration::from_millis(500))
+                .unwrap()
+                .post(format!("https://127.0.0.1:{port}/"))
+                .body("SELECT 42")
+                .send()
+                .await
+        };
+
+        let err = post(true).await.unwrap_err();
+        assert!(err.is_redirect(), "{err:?}");
+        assert!(!connected_within(&plain, Duration::from_millis(100)).await);
+
+        // Without `https_only` the same request is followed onto plain HTTP.
+        let _ = post(false).await;
+        assert!(connected_within(&plain, Duration::from_millis(500)).await);
     }
 
     #[test]
