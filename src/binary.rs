@@ -203,11 +203,20 @@ impl BinaryWriter {
 pub(crate) struct BinaryReader<'a> {
     bytes: &'a [u8],
     offset: usize,
+    incomplete: std::cell::Cell<bool>,
 }
 
 impl<'a> BinaryReader<'a> {
     pub(crate) fn new(bytes: &'a [u8]) -> Self {
-        Self { bytes, offset: 0 }
+        Self {
+            bytes,
+            offset: 0,
+            incomplete: std::cell::Cell::new(false),
+        }
+    }
+
+    pub(crate) fn is_incomplete(&self) -> bool {
+        self.incomplete.get()
     }
 
     pub(crate) fn remaining(&self) -> usize {
@@ -466,7 +475,8 @@ impl<'a> BinaryReader<'a> {
     }
 
     fn ensure(&self, length: usize) -> Result<()> {
-        if self.offset + length > self.bytes.len() {
+        if length > self.remaining() {
+            self.incomplete.set(true);
             return Err(QuackError::protocol(format!(
                 "unexpected end of input at offset {}; needed {} byte(s), have {}",
                 self.offset,

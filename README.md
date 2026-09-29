@@ -227,3 +227,20 @@ uses query UUIDs, acknowledged fetch batches, raw chunk payloads, and connection
 heartbeats. The v3 send-data write path is not implemented yet, so `append` and
 `append_rows` return an explicit unsupported-protocol error on a v3 connection;
 they continue to work on v1 connections.
+
+## Admission-aware proxies
+
+`envelope::inspect` reads only a bounded Quack header and distinguishes incomplete,
+invalid, and oversized input. It returns the operation, connection ID, query ID,
+and encoded header length without decoding SQL, authentication, or result data.
+Callers must cap collection at `MAX_ENVELOPE_BYTES` and replay the inspected bytes.
+`inspect_control_response` accepts only bounded complete connect, success, and
+error responses, including DuckDB's structured invalidation flag. Fatality is a
+conservative retirement signal and never authorizes replay.
+
+The client decodes recognized structured proxy HTTP failures as
+`QuackError::Proxy(ProxyError)`. This is a new error variant: exhaustive error
+matches must handle it. Unknown or oversized failures remain generic protocol
+errors; raw proxy messages are discarded. Supply assignment and lifecycle headers
+through `QuackClientOptions::headers`; the transport sends them on every request,
+including heartbeat and disconnect. Debug output redacts these headers.

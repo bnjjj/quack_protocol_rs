@@ -9,7 +9,7 @@ use crate::vector::{
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 #[repr(u64)]
-pub(crate) enum MessageType {
+pub enum MessageType {
     Invalid = 0,
     ConnectionRequest = 1,
     ConnectionResponse = 2,
@@ -810,22 +810,34 @@ fn read_optional_string(reader: &mut BinaryReader<'_>, field_id: u16) -> Result<
 /// the exception type (2), extra info (3) and a must-invalidate flag (4); the
 /// client reports only the message, so the rest is read past.
 fn read_error_message(object: &mut BinaryReader<'_>) -> Result<String> {
+    read_error_fields(object).map(|(message, _)| message)
+}
+
+// Share error decoding with bounded proxy inspection. Do not preallocate using
+// the untrusted extra-info count: malformed input must fail before allocation.
+pub(crate) fn read_error_fields(object: &mut BinaryReader<'_>) -> Result<(String, bool)> {
     let message = object.read_optional_field(1, |object| object.read_string(), String::new())?;
-    object.read_optional_field(2, |object| object.read_string().map(drop), ())?;
+    let exception = object.read_optional_field(2, |object| object.read_string(), String::new())?;
     object.read_optional_field(
         3,
         |object| {
-            object
-                .read_list(|object, _| {
-                    object.read_object(|entry| {
-                        entry.read_required_field(0, |entry| entry.read_string())?;
-                        entry.read_required_field(1, |entry| entry.read_string())
-                    })
-                })
-                .map(drop)
+            let length = object.read_uleb_usize()?;
+            for _ in 0..length {
+                object.read_object(|entry| {
+                    entry.read_required_field(0, |entry| entry.read_string())?;
+                    entry.read_required_field(1, |entry| entry.read_string())?;
+                    Ok(())
+                })?;
+            }
+            Ok(())
         },
         (),
     )?;
-    object.read_optional_field(4, |object| object.read_bool().map(drop), ())?;
-    Ok(message)
+    let invalidated = object.read_optional_field(4, |object| object.read_bool(), false)?;
+    let fatal = invalidated
+        || matches!(
+            exception.as_str(),
+            "FATAL" | "Fatal" | "INTERNAL" | "Internal"
+        );
+    Ok((message, fatal))
 }

@@ -76,7 +76,7 @@ impl std::fmt::Debug for QuackClientOptions {
             .field("heartbeat_timeout", &self.heartbeat_timeout)
             .field("ssl", &self.ssl)
             .field("timeout", &self.timeout)
-            .field("headers", &self.headers)
+            .field("headers", &"[redacted]")
             .finish()
     }
 }
@@ -875,8 +875,20 @@ impl Transport {
             request = request.headers(self.headers.clone());
         }
         request = request.timeout(self.timeout);
-        let response = request.send().await?;
+        let mut response = request.send().await?;
         if !response.status().is_success() {
+            let status = response.status();
+            let mut body = Vec::new();
+            while let Some(chunk) = response.chunk().await? {
+                if chunk.len() > 16 * 1024 - body.len() {
+                    body.clear();
+                    break;
+                }
+                body.extend_from_slice(&chunk);
+            }
+            if let Some(error) = crate::ProxyError::decode(status.as_u16(), &body) {
+                return Err(error.into());
+            }
             return Err(QuackError::protocol(format!(
                 "Quack HTTP request failed with {} {}",
                 response.status().as_u16(),
@@ -1320,5 +1332,49 @@ mod tests {
         // Cancels the task, so the connection is dropped from inside a runtime
         // that is already going away.
         drop(runtime);
+    }
+
+    #[tokio::test]
+    async fn structured_proxy_failure_is_decoded_by_transport() {
+        use std::io::{Read, Write};
+        let (listener, uri) = listening_socket();
+        listener.set_nonblocking(false).unwrap();
+        let server = std::thread::spawn(move || {
+            let (mut socket, _) = listener.accept().unwrap();
+            socket
+                .set_read_timeout(Some(Duration::from_secs(3)))
+                .unwrap();
+            let mut request = [0; 4096];
+            let count = socket.read(&mut request).unwrap();
+            assert!(
+                String::from_utf8_lossy(&request[..count])
+                    .contains("x-quaxy-assignment-id: example")
+            );
+            let body = r#"{"error":{"code":"at_capacity","message":"private details"}}"#;
+            write!(socket, "HTTP/1.1 429 Too Many Requests\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{}", body.len(), body).unwrap();
+        });
+        let transport = Transport {
+            base_url: uri,
+            http: reqwest::Client::new(),
+            headers: header_map(&[("x-quaxy-assignment-id".into(), "example".into())]).unwrap(),
+            timeout: Duration::from_secs(3),
+        };
+        let result = transport
+            .send(
+                &QuackMessage::HeartbeatRequest {
+                    header: MessageHeader {
+                        message_type: MessageType::HeartbeatRequest,
+                        connection_id: Some("example".into()),
+                        client_query_id: None,
+                    },
+                },
+                QUACK_V3,
+            )
+            .await;
+        assert!(matches!(
+            result,
+            Err(QuackError::Proxy(crate::ProxyError::AtCapacity))
+        ));
+        server.join().unwrap();
     }
 }
