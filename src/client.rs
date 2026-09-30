@@ -22,6 +22,7 @@ use crate::messages::{
     encode_message_for_version,
 };
 use crate::sql::{QuerySql, SqlParameters, format_sql};
+use crate::tls::{CertificatePin, pinned_client_config};
 use crate::vector::{DataChunk, Row, Value, rows_from_chunk_with_names};
 
 const DEFAULT_QUACK_REQUEST_TIMEOUT: Duration = Duration::from_secs(300);
@@ -49,6 +50,12 @@ pub struct QuackClientOptions {
     pub client_id: Option<String>,
     pub heartbeat_timeout: Option<Duration>,
     pub ssl: Option<bool>,
+    /// SHA-256 fingerprint of the server's TLS certificate, as DuckDB's
+    /// `ssl_fingerprint` takes it (hex, optionally colon-separated, optional
+    /// `sha256:` prefix). When set, the client trusts exactly that certificate
+    /// instead of verifying it against a CA, which is how a server's
+    /// self-signed certificate is authenticated. A pin implies HTTPS.
+    pub ssl_fingerprint: Option<String>,
     pub timeout: Option<Duration>,
     /// Extra HTTP headers sent with every request, as name/value pairs.
     /// Invalid names or values are reported when the client connects.
@@ -75,6 +82,7 @@ impl std::fmt::Debug for QuackClientOptions {
             .field("client_id", &self.client_id)
             .field("heartbeat_timeout", &self.heartbeat_timeout)
             .field("ssl", &self.ssl)
+            .field("ssl_fingerprint", &self.ssl_fingerprint)
             .field("timeout", &self.timeout)
             .field("headers", &self.headers)
             .finish()
@@ -92,6 +100,7 @@ impl Default for QuackClientOptions {
             client_id: None,
             heartbeat_timeout: Some(Duration::from_secs(DEFAULT_HEARTBEAT_TIMEOUT_SECS)),
             ssl: None,
+            ssl_fingerprint: None,
             timeout: Some(DEFAULT_QUACK_REQUEST_TIMEOUT),
             headers: Vec::new(),
         }
@@ -231,13 +240,29 @@ pub struct QuackClient {
 
 impl QuackClient {
     pub async fn connect(uri: &str, options: QuackClientOptions) -> Result<Self> {
-        let parsed = parse_quack_uri(uri, options.ssl)?;
+        let pin = options
+            .ssl_fingerprint
+            .as_deref()
+            .map(CertificatePin::parse)
+            .transpose()?;
+        if pin.is_some() && options.ssl == Some(false) {
+            return Err(QuackError::protocol(
+                "ssl_fingerprint requires HTTPS, but ssl is set to false",
+            ));
+        }
+        let ssl = if pin.is_some() {
+            Some(true)
+        } else {
+            options.ssl
+        };
+        let parsed = parse_quack_uri(uri, ssl)?;
+        if pin.is_some() && !parsed.ssl {
+            return Err(QuackError::protocol(format!(
+                "ssl_fingerprint requires HTTPS, but {uri} is an http URL"
+            )));
+        }
         let timeout = options.timeout.unwrap_or(DEFAULT_QUACK_REQUEST_TIMEOUT);
-        let http = reqwest::Client::builder()
-            .connect_timeout(DEFAULT_QUACK_CONNECT_TIMEOUT.min(timeout))
-            .pool_max_idle_per_host(0)
-            .timeout(timeout)
-            .build()?;
+        let http = http_client(parsed.ssl, pin, timeout)?;
         let base_url = parsed.base_url.trim_end_matches('/').to_string();
         let (connection, info) = Connection::connect(base_url, http, timeout, options).await?;
         let state = Arc::clone(&connection.state);
@@ -1063,6 +1088,25 @@ pub(crate) fn is_version_negotiation_error(error: &QuackError) -> bool {
         || message.contains("unexpected field")
 }
 
+// The HTTP client for one session. An HTTPS session stays on HTTPS: a
+// redirect to an `http://` URL is an error rather than a silent downgrade that
+// would send queries, and with a pin skip the pinned certificate, in plaintext.
+fn http_client(
+    ssl: bool,
+    pin: Option<CertificatePin>,
+    timeout: Duration,
+) -> Result<reqwest::Client> {
+    let mut http = reqwest::Client::builder()
+        .connect_timeout(DEFAULT_QUACK_CONNECT_TIMEOUT.min(timeout))
+        .pool_max_idle_per_host(0)
+        .https_only(ssl)
+        .timeout(timeout);
+    if let Some(pin) = pin {
+        http = http.use_preconfigured_tls(pinned_client_config(pin)?);
+    }
+    Ok(http.build()?)
+}
+
 pub(crate) fn parse_quack_uri(input: &str, ssl_override: Option<bool>) -> Result<ParsedQuackUri> {
     let uri = input.trim();
     if uri.is_empty() {
@@ -1211,6 +1255,38 @@ mod tests {
         false
     }
 
+    #[tokio::test]
+    async fn https_sessions_refuse_redirects_to_http() {
+        use crate::tls::test_server::{self, V1_CERT, V1_CERT_FINGERPRINT};
+
+        let (plain, plain_url) = listening_socket();
+        let port = test_server::serve(
+            V1_CERT,
+            format!(
+                "HTTP/1.1 307 Temporary Redirect\r\nlocation: {plain_url}/\r\n\
+                 content-length: 0\r\nconnection: close\r\n\r\n"
+            ),
+        )
+        .await;
+        let pin = Some(CertificatePin::parse(V1_CERT_FINGERPRINT).unwrap());
+        let post = |ssl| async move {
+            http_client(ssl, pin, Duration::from_millis(500))
+                .unwrap()
+                .post(format!("https://127.0.0.1:{port}/"))
+                .body("SELECT 42")
+                .send()
+                .await
+        };
+
+        let err = post(true).await.unwrap_err();
+        assert!(err.is_redirect(), "{err:?}");
+        assert!(!connected_within(&plain, Duration::from_millis(100)).await);
+
+        // Without `https_only` the same request is followed onto plain HTTP.
+        let _ = post(false).await;
+        assert!(connected_within(&plain, Duration::from_millis(500)).await);
+    }
+
     #[test]
     fn debug_output_redacts_the_auth_token() {
         let options = QuackClientOptions {
@@ -1225,6 +1301,36 @@ mod tests {
         assert!(
             format!("{:?}", QuackClientOptions::default()).contains("auth_token: None"),
             "an absent token is shown as absent"
+        );
+    }
+
+    #[tokio::test]
+    async fn a_pin_that_cannot_apply_fails_before_connecting() {
+        let (listener, base_url) = listening_socket();
+        let address = base_url.trim_start_matches("http://").to_string();
+        let pin = "sha256:".to_string() + &"AB".repeat(32);
+        let cases = [
+            (
+                address.clone(),
+                Some(false),
+                pin.clone(),
+                "ssl is set to false",
+            ),
+            (base_url.clone(), None, pin, "is an http URL"),
+            (address, None, "AB:CD".to_string(), "64 hex digits"),
+        ];
+        for (uri, ssl, fingerprint, expected) in cases {
+            let options = QuackClientOptions {
+                ssl,
+                ssl_fingerprint: Some(fingerprint),
+                ..Default::default()
+            };
+            let err = QuackClient::connect(&uri, options).await.unwrap_err();
+            assert!(err.to_string().contains(expected), "{uri}: {err}");
+        }
+        assert!(
+            !connected_within(&listener, Duration::from_millis(100)).await,
+            "an unusable pin should be rejected before any request"
         );
     }
 
