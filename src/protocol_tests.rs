@@ -725,3 +725,35 @@ fn decodes_error_response_with_exception_type_and_extra_info() {
         other => panic!("expected ERROR_RESPONSE, got {other:?}"),
     }
 }
+
+#[test]
+fn decodes_error_response_with_only_a_message() {
+    // An ERROR_RESPONSE as DuckDB 1.x servers send it: the message and nothing
+    // else. It must decode under both protocol versions.
+    for version in [QUACK_V1, QUACK_V3] {
+        let mut writer = binary::BinaryWriter::new();
+        crate::messages::encode_header(
+            &mut writer,
+            &MessageHeader {
+                message_type: MessageType::ErrorResponse,
+                connection_id: some_name("conn"),
+                client_query_id: None,
+            },
+        )
+        .unwrap();
+        writer
+            .write_object(|object| {
+                object.write_field(1, |object| {
+                    object.write_string("Catalog Error: Table with name t does not exist!")
+                })
+            })
+            .unwrap();
+
+        match decode_message_for_version(&writer.into_bytes(), version).unwrap() {
+            QuackMessage::ErrorResponse { message, .. } => {
+                assert_eq!(message, "Catalog Error: Table with name t does not exist!")
+            }
+            other => panic!("expected ERROR_RESPONSE, got {other:?}"),
+        }
+    }
+}

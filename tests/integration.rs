@@ -50,6 +50,54 @@ fn assert_decimal(value: &Value, unscaled: i128, width: u64, scale: u64) {
     }
 }
 
+// A server started with TLS (bound to a non-localhost address, e.g.
+// `quack_serve('quack:0.0.0.0:9496', allow_other_hostname => true)`) and the
+// fingerprint `quack_generate_keys()` or `quack_server_list()` reports for it.
+fn live_tls_server() -> Option<(String, String)> {
+    Some((
+        std::env::var("QUACK_TLS_SERVER_URI").ok()?,
+        std::env::var("QUACK_TLS_FINGERPRINT").ok()?,
+    ))
+}
+
+#[tokio::test]
+async fn live_quack_pinned_tls_connects_to_self_signed_server() -> Result<()> {
+    let Some((uri, fingerprint)) = live_tls_server() else {
+        return Ok(());
+    };
+
+    let options = QuackClientOptions {
+        ssl_fingerprint: Some(fingerprint),
+        ..live_options()
+    };
+    let client = QuackClient::connect(&uri, options).await?;
+    assert_eq!(
+        client.values("SELECT 42 AS answer").await?,
+        vec![Value::Int(42)]
+    );
+
+    client.disconnect().await?;
+    Ok(())
+}
+
+#[tokio::test]
+async fn live_quack_pinned_tls_rejects_other_certificates() -> Result<()> {
+    let Some((uri, _)) = live_tls_server() else {
+        return Ok(());
+    };
+
+    let options = QuackClientOptions {
+        ssl_fingerprint: Some("AB".repeat(32)),
+        ..live_options()
+    };
+    let error = QuackClient::connect(&uri, options)
+        .await
+        .expect_err("a certificate that does not match the pin must be rejected");
+    assert!(matches!(error, QuackError::Http(_)), "{error}");
+
+    Ok(())
+}
+
 #[tokio::test]
 async fn live_quack_reports_negotiated_version() -> Result<()> {
     let Some(client) = live_client().await? else {

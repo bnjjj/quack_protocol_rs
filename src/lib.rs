@@ -22,6 +22,7 @@ mod logical_types;
 mod messages;
 mod pool;
 mod sql;
+mod tls;
 mod values;
 mod vector;
 

@@ -2,7 +2,7 @@
 
 Rust client-side SDK for DuckDB's experimental Quack remote protocol.
 
-The `0.3.0-alpha` line supports both Quack protocol v1 and protocol v3 from
+The `0.3.0` line supports both Quack protocol v1 and protocol v3 from
 DuckDB 2.0 alpha:
 
 - DuckDB `BinarySerializer`-compatible primitive, object, logical type, vector, and `DataChunk` codecs.
@@ -104,6 +104,30 @@ name or value is reported when the client connects.
 A stream returned by `pool.query()` holds its connection until it is drained or
 dropped, so drop it when the results are no longer wanted rather than leaving it
 parked - the connection is not free until then.
+
+### TLS with a self-signed server certificate
+
+`quack_serve` uses HTTPS unless it is bound to localhost, and by default serves a
+self-signed certificate. A self-signed certificate does not verify against any
+CA, so, as DuckDB's own client does, authenticate the server by pinning the
+certificate's SHA-256 fingerprint - the one `quack_generate_keys()` returns, or
+`openssl x509 -in server.pem -noout -fingerprint -sha256` prints:
+
+```rust,ignore
+let client = QuackClient::connect(
+    "quack:myhost:9494",
+    QuackClientOptions {
+        ssl_fingerprint: Some("2B:31:F0:...:EA".to_string()),
+        ..Default::default()
+    },
+)
+.await?;
+```
+
+A pinned client trusts exactly that certificate and skips the CA and hostname
+checks; the TLS handshake is still verified against the certificate's key. A pin
+implies HTTPS, and pinned connections use TLS 1.3. Without a pin, HTTPS
+connections verify the server against the standard web PKI roots.
 
 ### Closing sessions
 
