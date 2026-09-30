@@ -600,11 +600,7 @@ fn decode_body_v1(reader: &mut BinaryReader<'_>, header: MessageHeader) -> Resul
         MessageType::ErrorResponse => reader.read_object(|object| {
             Ok(QuackMessage::ErrorResponse {
                 header,
-                message: object.read_optional_field(
-                    1,
-                    |object| object.read_string(),
-                    String::new(),
-                )?,
+                message: read_error_message(object)?,
             })
         }),
         other => Err(QuackError::protocol(format!(
@@ -735,11 +731,7 @@ fn decode_body_v3(reader: &mut BinaryReader<'_>, header: MessageHeader) -> Resul
         MessageType::ErrorResponse => reader.read_object(|object| {
             Ok(QuackMessage::ErrorResponse {
                 header,
-                message: object.read_optional_field(
-                    1,
-                    |object| object.read_string(),
-                    String::new(),
-                )?,
+                message: read_error_message(object)?,
             })
         }),
         other => Err(QuackError::protocol(format!(
@@ -812,4 +804,28 @@ fn read_optional_string(reader: &mut BinaryReader<'_>, field_id: u16) -> Result<
         |reader| Ok(Some(reader.read_string()?)),
         None::<String>,
     )
+}
+
+/// Reads an ERROR_RESPONSE body. Servers since DuckDB 2.0 follow the message with
+/// the exception type (2), extra info (3) and a must-invalidate flag (4); the
+/// client reports only the message, so the rest is read past.
+fn read_error_message(object: &mut BinaryReader<'_>) -> Result<String> {
+    let message = object.read_optional_field(1, |object| object.read_string(), String::new())?;
+    object.read_optional_field(2, |object| object.read_string().map(drop), ())?;
+    object.read_optional_field(
+        3,
+        |object| {
+            object
+                .read_list(|object, _| {
+                    object.read_object(|entry| {
+                        entry.read_required_field(0, |entry| entry.read_string())?;
+                        entry.read_required_field(1, |entry| entry.read_string())
+                    })
+                })
+                .map(drop)
+        },
+        (),
+    )?;
+    object.read_optional_field(4, |object| object.read_bool().map(drop), ())?;
+    Ok(message)
 }
