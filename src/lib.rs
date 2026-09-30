@@ -16,7 +16,7 @@ mod constants;
 mod errors;
 mod proxy_error;
 pub use proxy_error::ProxyError;
-pub mod envelope;
+pub mod inspection;
 mod json;
 mod logical_types;
 mod messages;

@@ -254,10 +254,12 @@ they continue to work on v1 connections.
 
 ## Admission-aware proxies
 
-`envelope::inspect` reads only a bounded Quack header and distinguishes incomplete,
-invalid, and oversized input. It returns the operation, connection ID, query ID,
-and encoded header length without decoding SQL, authentication, or result data.
-Callers must cap collection at `MAX_ENVELOPE_BYTES` and replay the inspected bytes.
+`inspection::inspect_message_header` reads only a bounded Quack header and
+distinguishes incomplete, invalid, and oversized input. It returns an
+`inspection::MessageHeader` containing the operation, connection ID, query ID, and
+encoded header length without decoding SQL, authentication, or result data.
+Callers must cap collection at `MAX_MESSAGE_HEADER_BYTES` and replay the inspected
+bytes.
 `inspect_control_response` accepts only bounded complete connect, success, and
 error responses, including DuckDB's structured invalidation flag. Fatality is a
 conservative retirement signal and never authorizes replay.

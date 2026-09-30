@@ -1,7 +1,7 @@
 //! Bounded metadata inspection for HTTP proxies. Payloads remain opaque.
 //!
 //! Headers share the client's codec. Incomplete input is distinct from invalid
-//! input; callers must stop collecting at [`MAX_ENVELOPE_BYTES`]. Neither this
+//! input; callers must stop collecting at [`MAX_MESSAGE_HEADER_BYTES`]. Neither this
 //! API nor its errors expose SQL, authentication fields, or upstream error text.
 
 pub use crate::messages::MessageType as Operation;
@@ -11,12 +11,12 @@ use crate::{
     messages::{self, QuackMessage},
 };
 
-pub const MAX_ENVELOPE_BYTES: usize = 4096;
+pub const MAX_MESSAGE_HEADER_BYTES: usize = 4096;
 pub const MAX_CONTROL_RESPONSE_BYTES: usize = 16 * 1024;
 pub const MAX_CONNECTION_ID_BYTES: usize = 256;
 
 #[derive(Clone, Debug, Eq, PartialEq)]
-pub struct Envelope {
+pub struct MessageHeader {
     pub operation: Operation,
     pub connection_id: Option<String>,
     pub client_query_id: Option<u64>,
@@ -26,22 +26,22 @@ pub struct Envelope {
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq, thiserror::Error)]
 pub enum InspectionError {
-    #[error("incomplete quack envelope")]
+    #[error("incomplete quack message header")]
     Incomplete,
-    #[error("invalid quack envelope")]
+    #[error("invalid quack message header")]
     Invalid,
     #[error("quack metadata exceeds inspection limit")]
     TooLarge,
 }
 
 /// Inspects only the header, even when `prefix` also contains a large payload.
-pub fn inspect(prefix: &[u8]) -> Result<Envelope, InspectionError> {
-    let bounded = &prefix[..prefix.len().min(MAX_ENVELOPE_BYTES)];
+pub fn inspect_message_header(prefix: &[u8]) -> Result<MessageHeader, InspectionError> {
+    let bounded = &prefix[..prefix.len().min(MAX_MESSAGE_HEADER_BYTES)];
     let mut reader = BinaryReader::new(bounded);
     let header = match messages::decode_header(&mut reader) {
         Ok(header) => header,
         Err(_) if reader.is_incomplete() => {
-            return Err(if bounded.len() == MAX_ENVELOPE_BYTES {
+            return Err(if bounded.len() == MAX_MESSAGE_HEADER_BYTES {
                 InspectionError::TooLarge
             } else {
                 InspectionError::Incomplete
@@ -56,7 +56,7 @@ pub fn inspect(prefix: &[u8]) -> Result<Envelope, InspectionError> {
     {
         return Err(InspectionError::TooLarge);
     }
-    Ok(Envelope {
+    Ok(MessageHeader {
         operation: header.message_type,
         connection_id: header.connection_id,
         client_query_id: header.client_query_id,
@@ -76,7 +76,7 @@ pub fn inspect_control_response(bytes: &[u8]) -> Result<ControlResponse, Inspect
     if bytes.len() > MAX_CONTROL_RESPONSE_BYTES {
         return Err(InspectionError::TooLarge);
     }
-    let header = inspect(bytes)?;
+    let header = inspect_message_header(bytes)?;
     if !matches!(
         header.operation,
         Operation::ConnectionResponse | Operation::SuccessResponse | Operation::ErrorResponse
@@ -125,11 +125,11 @@ mod tests {
     use super::*;
     use crate::{
         binary::BinaryWriter,
-        messages::{MessageHeader, encode_header, encode_message},
+        messages::{MessageHeader as WireMessageHeader, encode_header, encode_message},
     };
 
-    fn header(operation: Operation, connection: Option<&str>) -> MessageHeader {
-        MessageHeader {
+    fn header(operation: Operation, connection: Option<&str>) -> WireMessageHeader {
+        WireMessageHeader {
             message_type: operation,
             connection_id: connection.map(str::to_owned),
             client_query_id: Some(42),
@@ -152,36 +152,45 @@ mod tests {
             encode_header(&mut writer, &header(operation, Some("connection-example"))).unwrap();
             let mut bytes = writer.into_bytes();
             for end in 0..bytes.len() {
-                assert_eq!(inspect(&bytes[..end]), Err(InspectionError::Incomplete));
+                assert_eq!(
+                    inspect_message_header(&bytes[..end]),
+                    Err(InspectionError::Incomplete)
+                );
             }
-            let expected = inspect(&bytes).unwrap();
+            let expected = inspect_message_header(&bytes).unwrap();
             assert_eq!(expected.operation, operation);
             assert_eq!(expected.client_query_id, Some(42));
             assert_eq!(expected.encoded_len, bytes.len());
             bytes.resize(1024 * 1024, 0xfe);
-            assert_eq!(inspect(&bytes).unwrap(), expected);
+            assert_eq!(inspect_message_header(&bytes).unwrap(), expected);
         }
     }
 
     #[test]
     fn malformed_and_oversized_headers_do_not_panic_or_echo_input() {
-        assert_eq!(inspect(&[2, 0, 1]), Err(InspectionError::Invalid));
+        assert_eq!(
+            inspect_message_header(&[2, 0, 1]),
+            Err(InspectionError::Invalid)
+        );
         let mut writer = BinaryWriter::new();
         encode_header(
             &mut writer,
             &header(Operation::PrepareRequest, Some(&"x".repeat(257))),
         )
         .unwrap();
-        assert_eq!(inspect(writer.as_slice()), Err(InspectionError::TooLarge));
-        for length in 0..MAX_ENVELOPE_BYTES + 20 {
+        assert_eq!(
+            inspect_message_header(writer.as_slice()),
+            Err(InspectionError::TooLarge)
+        );
+        for length in 0..MAX_MESSAGE_HEADER_BYTES + 20 {
             let bytes = vec![0xff; length];
-            assert!(inspect(&bytes).is_err());
+            assert!(inspect_message_header(&bytes).is_err());
         }
         // An attacker-controlled usize::MAX string length must not overflow ensure().
         let mut writer = BinaryWriter::new();
         writer.write_field(1, |w| w.write_uleb(3u64)).unwrap();
         writer.write_field(2, |w| w.write_uleb(u64::MAX)).unwrap();
-        assert!(inspect(writer.as_slice()).is_err());
+        assert!(inspect_message_header(writer.as_slice()).is_err());
     }
 
     #[test]
