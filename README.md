@@ -2,7 +2,7 @@
 
 Rust client-side SDK for DuckDB's experimental Quack remote protocol.
 
-The `0.3.0-alpha` line supports both Quack protocol v1 and protocol v3 from
+The `0.3.0` line supports both Quack protocol v1 and protocol v3 from
 DuckDB 2.0 alpha:
 
 - DuckDB `BinarySerializer`-compatible primitive, object, logical type, vector, and `DataChunk` codecs.
