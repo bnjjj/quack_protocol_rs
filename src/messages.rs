@@ -890,6 +890,8 @@ fn read_error_response(
 ) -> Result<QuackMessage> {
     let message = object.read_optional_field(1, |object| object.read_string(), String::new())?;
     let exception_type = read_optional_string(object, 2)?;
+    // read_list reserves no more than the bytes left, so a hostile count can't
+    // make this allocate before it fails
     let extra_info = object.read_optional_field(
         3,
         |object| {
@@ -911,4 +913,24 @@ fn read_error_response(
         extra_info,
         must_invalidate,
     })
+}
+
+/// The message of an ERROR_RESPONSE body, and whether the server is unusable: it
+/// says so, or it raised a FATAL or INTERNAL error. Shared with proxy inspection.
+pub(crate) fn read_error_fields(object: &mut BinaryReader<'_>) -> Result<(String, bool)> {
+    let QuackMessage::ErrorResponse {
+        message,
+        exception_type,
+        must_invalidate,
+        ..
+    } = read_error_response(object, MessageHeader::new(MessageType::ErrorResponse))?
+    else {
+        return Err(QuackError::protocol("expected an ERROR_RESPONSE body"));
+    };
+    let fatal = must_invalidate
+        || matches!(
+            exception_type.as_deref(),
+            Some("FATAL" | "Fatal" | "INTERNAL" | "Internal")
+        );
+    Ok((message, fatal))
 }

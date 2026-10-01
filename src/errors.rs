@@ -10,6 +10,8 @@ const RETIRE_CONNECTION_MESSAGES: [&str; 2] = [
 
 #[derive(Debug, thiserror::Error)]
 pub enum QuackError {
+    #[error(transparent)]
+    Proxy(#[from] crate::ProxyError),
     #[error("quack protocol error: {0}")]
     Protocol(String),
     #[error("quack server error: {0}")]
@@ -51,6 +53,10 @@ impl QuackError {
     pub fn is_connection_fatal(&self) -> bool {
         match self {
             Self::Http(_) | Self::Protocol(_) => true,
+            Self::Proxy(error) => !matches!(
+                error,
+                crate::ProxyError::QueryFailed | crate::ProxyError::ConnectionBusy
+            ),
             Self::Server(message) => RETIRE_CONNECTION_MESSAGES
                 .iter()
                 .any(|known| message == known),
