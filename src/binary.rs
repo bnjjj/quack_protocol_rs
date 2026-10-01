@@ -462,7 +462,8 @@ impl<'a> BinaryReader<'a> {
     }
 
     fn ensure(&self, length: usize) -> Result<()> {
-        if self.offset + length > self.bytes.len() {
+        // the length comes from the wire, so it can be anything up to usize::MAX
+        if length > self.remaining() {
             return Err(QuackError::protocol(format!(
                 "unexpected end of input at offset {}; needed {} byte(s), have {}",
                 self.offset,

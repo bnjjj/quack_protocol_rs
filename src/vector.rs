@@ -1504,6 +1504,11 @@ mod tests {
         let list = LogicalTypes::list(LogicalTypes::integer());
         assert!(decode(&writer.into_bytes(), &list, 1).is_err());
 
+        // a string that claims u64::MAX bytes
+        let mut writer = BinaryWriter::new();
+        writer.write_uleb(u64::MAX).unwrap();
+        assert!(BinaryReader::new(writer.as_slice()).read_string().is_err());
+
         // a list that claims 2^60 elements
         let mut writer = BinaryWriter::new();
         writer.write_uleb(1u64 << 60).unwrap();
