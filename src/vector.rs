@@ -1482,7 +1482,13 @@ mod tests {
                 object.write_field(100, |object| object.write_bool(false))?;
                 object.write_field(104, |object| object.write_uleb(1u64))?;
                 object.write_field(105, |object| {
-                    write_list_entries(object, &[ListEntry { offset: 0, length: 5 }])
+                    write_list_entries(
+                        object,
+                        &[ListEntry {
+                            offset: 0,
+                            length: 5,
+                        }],
+                    )
                 })?;
                 object.write_field(106, |object| {
                     encode_vector(
