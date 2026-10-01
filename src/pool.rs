@@ -700,6 +700,9 @@ mod tests {
         let ambiguous_error = QuackMessage::ErrorResponse {
             header: MessageHeader::new(MessageType::ErrorResponse),
             message: "Invalid connection id".to_string(),
+            exception_type: None,
+            extra_info: Vec::new(),
+            must_invalidate: false,
         };
         let disconnect_response = QuackMessage::SuccessResponse {
             header: MessageHeader::new(MessageType::SuccessResponse),

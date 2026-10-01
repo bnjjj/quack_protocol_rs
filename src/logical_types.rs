@@ -503,10 +503,7 @@ impl LogicalType {
     }
 }
 
-pub(crate) fn encode_logical_type(
-    writer: &mut BinaryWriter,
-    logical_type: &LogicalType,
-) -> Result<()> {
+pub fn encode_logical_type(writer: &mut BinaryWriter, logical_type: &LogicalType) -> Result<()> {
     writer.write_object(|object| {
         object.write_field(100, |object| object.write_uleb(logical_type.id as u64))?;
         if let Some(info) = &logical_type.type_info {
@@ -518,7 +515,7 @@ pub(crate) fn encode_logical_type(
     })
 }
 
-pub(crate) fn decode_logical_type(reader: &mut BinaryReader<'_>) -> Result<LogicalType> {
+pub fn decode_logical_type(reader: &mut BinaryReader<'_>) -> Result<LogicalType> {
     reader.read_object(|object| {
         let id = LogicalTypeId::try_from(
             object.read_required_field(100, |object| object.read_uleb_u64())?,
