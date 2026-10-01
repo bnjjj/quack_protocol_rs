@@ -915,22 +915,31 @@ fn read_error_response(
     })
 }
 
-/// The message of an ERROR_RESPONSE body, and whether the server is unusable: it
-/// says so, or it raised a FATAL or INTERNAL error. Shared with proxy inspection.
+// Share error decoding with bounded proxy inspection. Do not preallocate using
+// the untrusted extra-info count: malformed input must fail before allocation.
 pub(crate) fn read_error_fields(object: &mut BinaryReader<'_>) -> Result<(String, bool)> {
-    let QuackMessage::ErrorResponse {
-        message,
-        exception_type,
-        must_invalidate,
-        ..
-    } = read_error_response(object, MessageHeader::new(MessageType::ErrorResponse))?
-    else {
-        return Err(QuackError::protocol("expected an ERROR_RESPONSE body"));
-    };
-    let fatal = must_invalidate
+    let message = object.read_optional_field(1, |object| object.read_string(), String::new())?;
+    let exception = object.read_optional_field(2, |object| object.read_string(), String::new())?;
+    object.read_optional_field(
+        3,
+        |object| {
+            let length = object.read_uleb_usize()?;
+            for _ in 0..length {
+                object.read_object(|entry| {
+                    entry.read_required_field(0, |entry| entry.read_string())?;
+                    entry.read_required_field(1, |entry| entry.read_string())?;
+                    Ok(())
+                })?;
+            }
+            Ok(())
+        },
+        (),
+    )?;
+    let invalidated = object.read_optional_field(4, |object| object.read_bool(), false)?;
+    let fatal = invalidated
         || matches!(
-            exception_type.as_deref(),
-            Some("FATAL" | "Fatal" | "INTERNAL" | "Internal")
+            exception.as_str(),
+            "FATAL" | "Fatal" | "INTERNAL" | "Internal"
         );
     Ok((message, fatal))
 }
