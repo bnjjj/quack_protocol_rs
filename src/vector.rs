@@ -457,7 +457,9 @@ fn decode_flat_vector_body(
     };
     let physical_type = get_physical_type(logical_type)?;
     if is_constant_size_physical_type(physical_type) {
-        let byte_length = physical_type_size(physical_type)? * count;
+        let byte_length = physical_type_size(physical_type)?
+            .checked_mul(count)
+            .ok_or_else(|| QuackError::protocol(format!("vector of {count} rows is too large")))?;
         let bytes = reader.read_required_field(102, |reader| reader.read_blob())?;
         if bytes.len() != byte_length {
             return Err(QuackError::protocol(format!(
@@ -551,13 +553,23 @@ fn decode_flat_vector_body(
                 .enumerate()
                 .map(|(row_index, entry)| {
                     if !is_valid(validity.as_deref(), row_index) {
-                        return Value::Null;
+                        return Ok(Value::Null);
                     }
-                    Value::List(
-                        child_vector.values[entry.offset..entry.offset + entry.length].to_vec(),
-                    )
+                    let items = entry
+                        .offset
+                        .checked_add(entry.length)
+                        .and_then(|end| child_vector.values.get(entry.offset..end))
+                        .ok_or_else(|| {
+                            QuackError::protocol(format!(
+                                "LIST entry {row_index} ({}, {}) is outside its {} child values",
+                                entry.offset,
+                                entry.length,
+                                child_vector.values.len()
+                            ))
+                        })?;
+                    Ok(Value::List(items.to_vec()))
                 })
-                .collect();
+                .collect::<Result<Vec<_>>>()?;
             Ok(DecodedVector {
                 logical_type: logical_type.clone(),
                 vector_type,
@@ -573,8 +585,11 @@ fn decode_flat_vector_body(
                 )));
             }
             let child_type = get_child_type(logical_type)?;
+            let child_count = array_size.checked_mul(count).ok_or_else(|| {
+                QuackError::protocol(format!("ARRAY of {count} x {array_size} is too large"))
+            })?;
             let child_vector = reader.read_required_field(104, |reader| {
-                decode_vector(reader, child_type, array_size * count)
+                decode_vector(reader, child_type, child_count)
             })?;
             let values = (0..count)
                 .map(|row_index| {
@@ -685,11 +700,11 @@ fn read_string_vector_data(
 
     let length_data = reader.read_required_field(108, |reader| reader.read_blob())?;
     let byte_data = reader.read_required_field(109, |reader| reader.read_blob())?;
-    if length_data.len() != count * size_of::<u32>() {
+    if Some(length_data.len()) != count.checked_mul(size_of::<u32>()) {
         return Err(QuackError::protocol(format!(
             "string vector has {} bytes of lengths, expected {} for {count} rows",
             length_data.len(),
-            count * size_of::<u32>()
+            count.saturating_mul(size_of::<u32>())
         )));
     }
     if byte_data.len() as u64 != byte_data_length {
@@ -1020,7 +1035,9 @@ fn encode_array_vector_body(
 }
 
 fn read_selection_vector(reader: &mut BinaryReader<'_>, count: usize) -> Result<Vec<usize>> {
-    let expected_bytes = count * 4;
+    let expected_bytes = count
+        .checked_mul(4)
+        .ok_or_else(|| QuackError::protocol("selection vector is too large"))?;
     let bytes = reader.read_blob()?;
     if bytes.len() != expected_bytes {
         return Err(QuackError::protocol(format!(
@@ -1053,10 +1070,11 @@ fn read_validity_mask(reader: &mut BinaryReader<'_>, count: usize) -> Result<Vec
 
 /// Packs row validity into DuckDB's mask: one bit per row, in 64-bit words.
 pub fn write_validity_mask(validity: &[bool]) -> Vec<u8> {
-    let mut bytes = vec![0u8; validity_mask_size(validity.len())];
+    // as DuckDB's ValidityMask: all valid, padding included, then the NULLs cleared
+    let mut bytes = vec![0xffu8; validity_mask_size(validity.len())];
     for (index, valid) in validity.iter().enumerate() {
-        if *valid {
-            bytes[index / 8] |= 1 << (index % 8);
+        if !*valid {
+            bytes[index / 8] &= !(1 << (index % 8));
         }
     }
     bytes
@@ -1429,6 +1447,48 @@ mod tests {
             decode(&writer.into_bytes(), &LogicalTypes::varchar(), 2).unwrap(),
             values
         );
+    }
+
+    #[test]
+    fn hostile_list_entries_and_counts_are_errors_not_panics() {
+        // a LIST vector whose entry points past its one child value
+        let mut writer = BinaryWriter::new();
+        writer
+            .write_object(|object| {
+                object.write_field(100, |object| object.write_bool(false))?;
+                object.write_field(104, |object| object.write_uleb(1u64))?;
+                object.write_field(105, |object| {
+                    write_list_entries(object, &[ListEntry { offset: 0, length: 5 }])
+                })?;
+                object.write_field(106, |object| {
+                    encode_vector(
+                        object,
+                        &LogicalTypes::integer(),
+                        &[Value::Int(1)],
+                        1,
+                        StringLayout::List,
+                    )
+                })
+            })
+            .unwrap();
+        let list = LogicalTypes::list(LogicalTypes::integer());
+        assert!(decode(&writer.into_bytes(), &list, 1).is_err());
+
+        // a list that claims 2^60 elements
+        let mut writer = BinaryWriter::new();
+        writer.write_uleb(1u64 << 60).unwrap();
+        let mut reader = BinaryReader::new(writer.as_slice());
+        assert!(reader.read_list(|reader, _| reader.read_byte()).is_err());
+
+        // a fixed-size vector of usize::MAX rows
+        let mut writer = BinaryWriter::new();
+        writer
+            .write_object(|object| {
+                object.write_field(100, |object| object.write_bool(false))?;
+                object.write_field(102, |object| object.write_blob(&[0; 8]))
+            })
+            .unwrap();
+        assert!(decode(&writer.into_bytes(), &LogicalTypes::bigint(), usize::MAX).is_err());
     }
 
     #[test]

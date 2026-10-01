@@ -379,7 +379,9 @@ impl<'a> BinaryReader<'a> {
         mut read_element: impl FnMut(&mut Self, usize) -> Result<T>,
     ) -> Result<Vec<T>> {
         let length = self.read_uleb_usize()?;
-        let mut result = Vec::with_capacity(length);
+        // The length comes from the wire: every element takes at least one byte, so
+        // don't reserve more than the bytes left could hold.
+        let mut result = Vec::with_capacity(length.min(self.remaining()));
         for index in 0..length {
             result.push(read_element(self, index)?);
         }
