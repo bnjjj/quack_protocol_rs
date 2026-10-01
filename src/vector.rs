@@ -850,7 +850,7 @@ fn encode_fixed_value(
     value: &Value,
 ) -> Result<()> {
     if value.is_null() {
-        return writer.write_bytes(&vec![0; physical_type_size(physical_type)?]);
+        return write_null_value(writer, physical_type);
     }
     match physical_type {
         PhysicalType::Bool => writer.write_fixed_u8(if matches!(value, Value::Bool(true)) {
@@ -913,6 +913,30 @@ fn encode_fixed_value(
         other => Err(QuackError::unsupported(format!(
             "cannot encode fixed physical type {other:?}"
         ))),
+    }
+}
+
+/// Writes what DuckDB stores in a NULL slot (`NullValue<T>()`): the minimum of a
+/// signed type, 0 of an unsigned one, NaN for floats, each field's minimum for an
+/// INTERVAL.
+fn write_null_value(writer: &mut BinaryWriter, physical_type: PhysicalType) -> Result<()> {
+    match physical_type {
+        PhysicalType::Bool | PhysicalType::Int8 => writer.write_fixed_i8(i8::MIN),
+        PhysicalType::Int16 => writer.write_fixed_i16(i16::MIN),
+        PhysicalType::Int32 => writer.write_fixed_i32(i32::MIN),
+        PhysicalType::Int64 => writer.write_fixed_i64(i64::MIN),
+        PhysicalType::Int128 => {
+            writer.write_fixed_u64(0)?;
+            writer.write_fixed_i64(i64::MIN)
+        }
+        PhysicalType::Float => writer.write_fixed_f32(f32::NAN),
+        PhysicalType::Double => writer.write_fixed_f64(f64::NAN),
+        PhysicalType::Interval => {
+            writer.write_fixed_i32(i32::MIN)?;
+            writer.write_fixed_i32(i32::MIN)?;
+            writer.write_fixed_i64(i64::MIN)
+        }
+        other => writer.write_bytes(&vec![0; physical_type_size(other)?]),
     }
 }
 
