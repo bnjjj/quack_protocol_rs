@@ -3,10 +3,11 @@ use crate::constants::{OPTIONAL_INDEX_INVALID, QUACK_V1, QUACK_V3};
 use crate::errors::{QuackError, Result};
 use crate::logical_types::{LogicalType, decode_logical_type, encode_logical_type};
 use crate::vector::{
-    DataChunk, decode_data_chunk, decode_data_chunk_wrapper, encode_data_chunk,
-    encode_data_chunk_wrapper,
+    DataChunk, StringLayout, decode_data_chunk, decode_data_chunk_wrapper,
+    encode_data_chunk_with_layout, encode_data_chunk_wrapper,
 };
 
+/// The type tag in a message header (`MessageType` in DuckDB's `quack_message.hpp`).
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 #[repr(u64)]
 pub enum MessageType {
@@ -56,15 +57,16 @@ impl TryFrom<u64> for MessageType {
     }
 }
 
+/// The header that precedes every message body.
 #[derive(Clone, Debug, PartialEq, Eq)]
-pub(crate) struct MessageHeader {
-    pub(crate) message_type: MessageType,
-    pub(crate) connection_id: Option<String>,
-    pub(crate) client_query_id: Option<u64>,
+pub struct MessageHeader {
+    pub message_type: MessageType,
+    pub connection_id: Option<String>,
+    pub client_query_id: Option<u64>,
 }
 
 impl MessageHeader {
-    pub(crate) fn new(message_type: MessageType) -> Self {
+    pub fn new(message_type: MessageType) -> Self {
         Self {
             message_type,
             connection_id: None,
@@ -72,19 +74,20 @@ impl MessageHeader {
         }
     }
 
-    pub(crate) fn with_connection(mut self, connection_id: impl Into<String>) -> Self {
+    pub fn with_connection(mut self, connection_id: impl Into<String>) -> Self {
         self.connection_id = Some(connection_id.into());
         self
     }
 
-    pub(crate) fn with_client_query_id(mut self, client_query_id: u64) -> Self {
+    pub fn with_client_query_id(mut self, client_query_id: u64) -> Self {
         self.client_query_id = Some(client_query_id);
         self
     }
 }
 
+/// A decoded Quack message, for either direction.
 #[derive(Clone, Debug, PartialEq)]
-pub(crate) enum QuackMessage {
+pub enum QuackMessage {
     ConnectionRequest {
         header: MessageHeader,
         auth_string: Option<String>,
@@ -131,6 +134,16 @@ pub(crate) enum QuackMessage {
     HeartbeatRequest {
         header: MessageHeader,
     },
+    /// Cancels the running query. A zero uuid cancels whatever runs on the connection.
+    CancelRequest {
+        header: MessageHeader,
+        query_uuid: HugeIntParts,
+    },
+    /// The client has the whole result, so the server may drop what it retained for a replay.
+    Acknowledgement {
+        header: MessageHeader,
+        query_uuid: HugeIntParts,
+    },
     AppendRequest {
         header: MessageHeader,
         schema_name: Option<String>,
@@ -146,11 +159,17 @@ pub(crate) enum QuackMessage {
     ErrorResponse {
         header: MessageHeader,
         message: String,
+        /// DuckDB's exception type name, e.g. `Catalog` or `Parser` (v3 only).
+        exception_type: Option<String>,
+        /// DuckDB's error extra info (v3 only).
+        extra_info: Vec<(String, String)>,
+        /// The server database is unusable, so the client must not reuse it (v3 only).
+        must_invalidate: bool,
     },
 }
 
 impl QuackMessage {
-    pub(crate) fn header(&self) -> &MessageHeader {
+    pub fn header(&self) -> &MessageHeader {
         match self {
             Self::ConnectionRequest { header, .. }
             | Self::ConnectionResponse { header, .. }
@@ -159,6 +178,8 @@ impl QuackMessage {
             | Self::FetchRequest { header, .. }
             | Self::FetchResponse { header, .. }
             | Self::HeartbeatRequest { header }
+            | Self::CancelRequest { header, .. }
+            | Self::Acknowledgement { header, .. }
             | Self::AppendRequest { header, .. }
             | Self::SuccessResponse { header }
             | Self::Disconnect { header }
@@ -166,7 +187,7 @@ impl QuackMessage {
         }
     }
 
-    pub(crate) fn message_type(&self) -> MessageType {
+    pub fn message_type(&self) -> MessageType {
         self.header().message_type
     }
 }
@@ -176,10 +197,8 @@ pub(crate) fn encode_message(message: &QuackMessage) -> Result<Vec<u8>> {
     encode_message_for_version(message, QUACK_V3)
 }
 
-pub(crate) fn encode_message_for_version(
-    message: &QuackMessage,
-    quack_version: u64,
-) -> Result<Vec<u8>> {
+/// Encodes `message` (header and body) in the given protocol version.
+pub fn encode_message_for_version(message: &QuackMessage, quack_version: u64) -> Result<Vec<u8>> {
     let mut writer = BinaryWriter::new();
     encode_header(&mut writer, message.header())?;
     match quack_version {
@@ -199,7 +218,8 @@ pub(crate) fn decode_message(bytes: &[u8]) -> Result<QuackMessage> {
     decode_message_for_version(bytes, QUACK_V3)
 }
 
-pub(crate) fn decode_message_for_version(bytes: &[u8], quack_version: u64) -> Result<QuackMessage> {
+/// Decodes one message (header and body), and fails on trailing bytes.
+pub fn decode_message_for_version(bytes: &[u8], quack_version: u64) -> Result<QuackMessage> {
     let mut reader = BinaryReader::new(bytes);
     let header = decode_header(&mut reader)?;
     let message = match quack_version {
@@ -215,7 +235,7 @@ pub(crate) fn decode_message_for_version(bytes: &[u8], quack_version: u64) -> Re
     Ok(message)
 }
 
-pub(crate) fn encode_header(writer: &mut BinaryWriter, header: &MessageHeader) -> Result<()> {
+pub fn encode_header(writer: &mut BinaryWriter, header: &MessageHeader) -> Result<()> {
     writer.write_object(|object| {
         object.write_field(1, |object| object.write_uleb(header.message_type as u64))?;
         if let Some(connection_id) = header
@@ -232,7 +252,7 @@ pub(crate) fn encode_header(writer: &mut BinaryWriter, header: &MessageHeader) -
     })
 }
 
-pub(crate) fn decode_header(reader: &mut BinaryReader<'_>) -> Result<MessageHeader> {
+pub fn decode_header(reader: &mut BinaryReader<'_>) -> Result<MessageHeader> {
     reader.read_object(|object| {
         let message_type =
             MessageType::try_from(object.read_required_field(1, |object| object.read_uleb_u64())?)?;
@@ -309,7 +329,9 @@ fn encode_body_v1(writer: &mut BinaryWriter, message: &QuackMessage) -> Result<(
                 object.write_field(3, |object| object.write_bool(true))?;
             }
             if !results.is_empty() {
-                object.write_field(4, |object| write_chunk_pointer_list(object, results))?;
+                object.write_field(4, |object| {
+                    write_chunk_pointer_list(object, results, StringLayout::List)
+                })?;
             }
             object.write_field(5, |object| object.write_huge_int_parts(*result_uuid))?;
             Ok(())
@@ -324,7 +346,9 @@ fn encode_body_v1(writer: &mut BinaryWriter, message: &QuackMessage) -> Result<(
             ..
         } => writer.write_object(|object| {
             if !results.is_empty() {
-                object.write_field(1, |object| write_chunk_pointer_list(object, results))?;
+                object.write_field(1, |object| {
+                    write_chunk_pointer_list(object, results, StringLayout::List)
+                })?;
             }
             object.write_field(2, |object| {
                 object.write_uleb(batch_index.unwrap_or(OPTIONAL_INDEX_INVALID))
@@ -340,13 +364,18 @@ fn encode_body_v1(writer: &mut BinaryWriter, message: &QuackMessage) -> Result<(
             write_optional_string(object, 1, schema_name.as_deref())?;
             write_optional_string(object, 2, Some(table_name))?;
             object.write_field(3, |object| {
-                object.write_nullable(Some(append_chunk), encode_data_chunk_wrapper)
+                object.write_nullable(Some(append_chunk), |object, chunk| {
+                    encode_data_chunk_wrapper(object, chunk, StringLayout::List)
+                })
             })?;
             Ok(())
         }),
         QuackMessage::HeartbeatRequest { .. } => Err(QuackError::protocol(
             "HEARTBEAT_REQUEST is not supported by Quack protocol v1",
         )),
+        QuackMessage::CancelRequest { .. } | QuackMessage::Acknowledgement { .. } => Err(
+            QuackError::protocol("CANCEL_REQUEST and ACKNOWLEDGEMENT need Quack protocol v3"),
+        ),
         QuackMessage::SuccessResponse { .. } | QuackMessage::Disconnect { .. } => {
             writer.write_object(|_| Ok(()))
         }
@@ -437,7 +466,9 @@ fn encode_body_v3(writer: &mut BinaryWriter, message: &QuackMessage) -> Result<(
                 object.write_field(3, |object| object.write_bool(true))?;
             }
             if !results.is_empty() {
-                object.write_field(4, |object| write_chunk_pointer_list(object, results))?;
+                object.write_field(4, |object| {
+                    write_chunk_pointer_list(object, results, StringLayout::LengthsAndBytes)
+                })?;
             }
             object.write_field(5, |object| object.write_huge_int_parts(*result_uuid))?;
             Ok(())
@@ -471,7 +502,7 @@ fn encode_body_v3(writer: &mut BinaryWriter, message: &QuackMessage) -> Result<(
                 Ok(())
             })?;
             for result in results {
-                encode_data_chunk(writer, result)?;
+                encode_data_chunk_with_layout(writer, result, StringLayout::LengthsAndBytes)?;
             }
             Ok(())
         }
@@ -481,8 +512,37 @@ fn encode_body_v3(writer: &mut BinaryWriter, message: &QuackMessage) -> Result<(
         QuackMessage::SuccessResponse { .. }
         | QuackMessage::Disconnect { .. }
         | QuackMessage::HeartbeatRequest { .. } => writer.write_object(|_| Ok(())),
-        QuackMessage::ErrorResponse { message, .. } => writer.write_object(|object| {
+        QuackMessage::CancelRequest { query_uuid, .. } => writer.write_object(|object| {
+            object.write_field(1, |object| object.write_huge_int_parts(*query_uuid))
+        }),
+        QuackMessage::Acknowledgement { query_uuid, .. } => writer.write_object(|object| {
+            if *query_uuid != (HugeIntParts { upper: 0, lower: 0 }) {
+                object.write_field(1, |object| object.write_huge_int_parts(*query_uuid))?;
+            }
+            Ok(())
+        }),
+        QuackMessage::ErrorResponse {
+            message,
+            exception_type,
+            extra_info,
+            must_invalidate,
+            ..
+        } => writer.write_object(|object| {
             write_optional_string(object, 1, Some(message))?;
+            write_optional_string(object, 2, exception_type.as_deref())?;
+            if !extra_info.is_empty() {
+                object.write_field(3, |object| {
+                    object.write_list(extra_info, |object, (key, value), _| {
+                        object.write_object(|entry| {
+                            entry.write_field(0, |entry| entry.write_string(key))?;
+                            entry.write_field(1, |entry| entry.write_string(value))
+                        })
+                    })
+                })?;
+            }
+            if *must_invalidate {
+                object.write_field(4, |object| object.write_bool(true))?;
+            }
             Ok(())
         }),
     }
@@ -597,12 +657,9 @@ fn decode_body_v1(reader: &mut BinaryReader<'_>, header: MessageHeader) -> Resul
         MessageType::DisconnectMessage => {
             reader.read_object(|_| Ok(QuackMessage::Disconnect { header }))
         }
-        MessageType::ErrorResponse => reader.read_object(|object| {
-            Ok(QuackMessage::ErrorResponse {
-                header,
-                message: read_error_message(object)?,
-            })
-        }),
+        MessageType::ErrorResponse => {
+            reader.read_object(|object| read_error_response(object, header))
+        }
         other => Err(QuackError::protocol(format!(
             "cannot decode unsupported protocol-v1 message type {other:?}"
         ))),
@@ -728,12 +785,25 @@ fn decode_body_v3(reader: &mut BinaryReader<'_>, header: MessageHeader) -> Resul
         MessageType::HeartbeatRequest => {
             reader.read_object(|_| Ok(QuackMessage::HeartbeatRequest { header }))
         }
-        MessageType::ErrorResponse => reader.read_object(|object| {
-            Ok(QuackMessage::ErrorResponse {
+        MessageType::CancelRequest => reader.read_object(|object| {
+            Ok(QuackMessage::CancelRequest {
                 header,
-                message: read_error_message(object)?,
+                query_uuid: object.read_required_field(1, |object| object.read_huge_int_parts())?,
             })
         }),
+        MessageType::Acknowledgement => reader.read_object(|object| {
+            Ok(QuackMessage::Acknowledgement {
+                header,
+                query_uuid: object.read_optional_field(
+                    1,
+                    |object| object.read_huge_int_parts(),
+                    HugeIntParts { upper: 0, lower: 0 },
+                )?,
+            })
+        }),
+        MessageType::ErrorResponse => {
+            reader.read_object(|object| read_error_response(object, header))
+        }
         other => Err(QuackError::protocol(format!(
             "cannot decode unsupported message type {other:?}"
         ))),
@@ -750,9 +820,15 @@ fn read_chunk_pointer_list(reader: &mut BinaryReader<'_>) -> Result<Vec<DataChun
     })
 }
 
-fn write_chunk_pointer_list(writer: &mut BinaryWriter, chunks: &[DataChunk]) -> Result<()> {
+fn write_chunk_pointer_list(
+    writer: &mut BinaryWriter,
+    chunks: &[DataChunk],
+    layout: StringLayout,
+) -> Result<()> {
     writer.write_list(chunks, |writer, chunk, _| {
-        writer.write_nullable(Some(chunk), encode_data_chunk_wrapper)
+        writer.write_nullable(Some(chunk), |writer, chunk| {
+            encode_data_chunk_wrapper(writer, chunk, layout)
+        })
     })
 }
 
@@ -807,10 +883,36 @@ fn read_optional_string(reader: &mut BinaryReader<'_>, field_id: u16) -> Result<
 }
 
 /// Reads an ERROR_RESPONSE body. Servers since DuckDB 2.0 follow the message with
-/// the exception type (2), extra info (3) and a must-invalidate flag (4); the
-/// client reports only the message, so the rest is read past.
-fn read_error_message(object: &mut BinaryReader<'_>) -> Result<String> {
-    read_error_fields(object).map(|(message, _)| message)
+/// the exception type (2), extra info (3) and a must-invalidate flag (4).
+fn read_error_response(
+    object: &mut BinaryReader<'_>,
+    header: MessageHeader,
+) -> Result<QuackMessage> {
+    let message = object.read_optional_field(1, |object| object.read_string(), String::new())?;
+    let exception_type = read_optional_string(object, 2)?;
+    // read_list reserves no more than the bytes left, so a hostile count can't
+    // make this allocate before it fails
+    let extra_info = object.read_optional_field(
+        3,
+        |object| {
+            object.read_list(|object, _| {
+                object.read_object(|entry| {
+                    let key = entry.read_required_field(0, |entry| entry.read_string())?;
+                    let value = entry.read_required_field(1, |entry| entry.read_string())?;
+                    Ok((key, value))
+                })
+            })
+        },
+        Vec::new(),
+    )?;
+    let must_invalidate = object.read_optional_field(4, |object| object.read_bool(), false)?;
+    Ok(QuackMessage::ErrorResponse {
+        header,
+        message,
+        exception_type,
+        extra_info,
+        must_invalidate,
+    })
 }
 
 // Share error decoding with bounded proxy inspection. Do not preallocate using

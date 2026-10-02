@@ -12,6 +12,8 @@ categories = ["api-bindings", "database"]
 
 [features]
 arrow = ["dep:arrow-array", "dep:arrow-schema", "dep:arrow-buffer"]
+# Public message types and the response encoders a Quack server needs.
+server = []
 
 [dependencies]
 arrow-array = { version = "58", optional = true, default-features = false }

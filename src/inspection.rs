@@ -215,6 +215,9 @@ mod tests {
             let bytes = encode_message(&QuackMessage::ErrorResponse {
                 header: header(Operation::ErrorResponse, None),
                 message: message.into(),
+                exception_type: None,
+                extra_info: Vec::new(),
+                must_invalidate: false,
             })
             .unwrap();
             assert_eq!(

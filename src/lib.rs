@@ -21,6 +21,8 @@ mod json;
 mod logical_types;
 mod messages;
 mod pool;
+#[cfg(feature = "server")]
+pub mod server;
 mod sql;
 mod tls;
 mod values;

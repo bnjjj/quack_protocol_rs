@@ -37,6 +37,17 @@ impl TryFrom<u64> for VectorType {
     }
 }
 
+/// How a string-like (VARCHAR, BLOB, ...) vector is laid out on the wire.
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+pub enum StringLayout {
+    /// A list of strings (field 102), the layout before DuckDB storage version 2.0.
+    #[default]
+    List,
+    /// DuckDB storage version 2.0 (Quack v3): the byte length of the data (field 107), a
+    /// little-endian `u32` length for every row (108), then the bytes of the valid rows (109).
+    LengthsAndBytes,
+}
+
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum TimeUnit {
     Micros,
@@ -214,14 +225,17 @@ pub(crate) fn decode_data_chunk_wrapper(reader: &mut BinaryReader<'_>) -> Result
 pub(crate) fn encode_data_chunk_wrapper(
     writer: &mut BinaryWriter,
     chunk: &DataChunk,
+    layout: StringLayout,
 ) -> Result<()> {
     writer.write_object(|object| {
-        object.write_field(300, |object| encode_data_chunk(object, chunk))?;
+        object.write_field(300, |object| {
+            encode_data_chunk_with_layout(object, chunk, layout)
+        })?;
         Ok(())
     })
 }
 
-pub(crate) fn decode_data_chunk(reader: &mut BinaryReader<'_>) -> Result<DataChunk> {
+pub fn decode_data_chunk(reader: &mut BinaryReader<'_>) -> Result<DataChunk> {
     reader.read_object(|object| {
         let row_count = object.read_required_field(100, |object| object.read_uleb_usize())?;
         let types = object.read_required_field(101, |object| {
@@ -253,7 +267,17 @@ pub(crate) fn decode_data_chunk(reader: &mut BinaryReader<'_>) -> Result<DataChu
     })
 }
 
+#[cfg(test)]
 pub(crate) fn encode_data_chunk(writer: &mut BinaryWriter, chunk: &DataChunk) -> Result<()> {
+    encode_data_chunk_with_layout(writer, chunk, StringLayout::List)
+}
+
+/// Writes `chunk` as a DuckDB `DataChunk` object, with string vectors in `layout`.
+pub fn encode_data_chunk_with_layout(
+    writer: &mut BinaryWriter,
+    chunk: &DataChunk,
+    layout: StringLayout,
+) -> Result<()> {
     if chunk.types.len() != chunk.columns.len() {
         return Err(QuackError::protocol(
             "DataChunk type count must match column count",
@@ -278,7 +302,13 @@ pub(crate) fn encode_data_chunk(writer: &mut BinaryWriter, chunk: &DataChunk) ->
                         chunk.row_count
                     )));
                 }
-                encode_vector(object, logical_type, &column.values, chunk.row_count)
+                encode_vector(
+                    object,
+                    logical_type,
+                    &column.values,
+                    chunk.row_count,
+                    layout,
+                )
             })
         })?;
         Ok(())
@@ -298,8 +328,10 @@ pub(crate) fn encode_vector(
     logical_type: &LogicalType,
     values: &[Value],
     count: usize,
+    layout: StringLayout,
 ) -> Result<()> {
-    writer.write_object(|object| encode_flat_vector_body(object, logical_type, values, count))
+    writer
+        .write_object(|object| encode_flat_vector_body(object, logical_type, values, count, layout))
 }
 
 pub fn rows_from_chunk(chunk: &DataChunk) -> Result<Vec<Row>> {
@@ -425,7 +457,9 @@ fn decode_flat_vector_body(
     };
     let physical_type = get_physical_type(logical_type)?;
     if is_constant_size_physical_type(physical_type) {
-        let byte_length = physical_type_size(physical_type)? * count;
+        let byte_length = physical_type_size(physical_type)?
+            .checked_mul(count)
+            .ok_or_else(|| QuackError::protocol(format!("vector of {count} rows is too large")))?;
         let bytes = reader.read_required_field(102, |reader| reader.read_blob())?;
         if bytes.len() != byte_length {
             return Err(QuackError::protocol(format!(
@@ -519,13 +553,23 @@ fn decode_flat_vector_body(
                 .enumerate()
                 .map(|(row_index, entry)| {
                     if !is_valid(validity.as_deref(), row_index) {
-                        return Value::Null;
+                        return Ok(Value::Null);
                     }
-                    Value::List(
-                        child_vector.values[entry.offset..entry.offset + entry.length].to_vec(),
-                    )
+                    let items = entry
+                        .offset
+                        .checked_add(entry.length)
+                        .and_then(|end| child_vector.values.get(entry.offset..end))
+                        .ok_or_else(|| {
+                            QuackError::protocol(format!(
+                                "LIST entry {row_index} ({}, {}) is outside its {} child values",
+                                entry.offset,
+                                entry.length,
+                                child_vector.values.len()
+                            ))
+                        })?;
+                    Ok(Value::List(items.to_vec()))
                 })
-                .collect();
+                .collect::<Result<Vec<_>>>()?;
             Ok(DecodedVector {
                 logical_type: logical_type.clone(),
                 vector_type,
@@ -541,8 +585,11 @@ fn decode_flat_vector_body(
                 )));
             }
             let child_type = get_child_type(logical_type)?;
+            let child_count = array_size.checked_mul(count).ok_or_else(|| {
+                QuackError::protocol(format!("ARRAY of {count} x {array_size} is too large"))
+            })?;
             let child_vector = reader.read_required_field(104, |reader| {
-                decode_vector(reader, child_type, array_size * count)
+                decode_vector(reader, child_type, child_count)
             })?;
             let values = (0..count)
                 .map(|row_index| {
@@ -570,6 +617,7 @@ fn encode_flat_vector_body(
     logical_type: &LogicalType,
     values: &[Value],
     count: usize,
+    layout: StringLayout,
 ) -> Result<()> {
     if values.len() != count {
         return Err(QuackError::protocol(format!(
@@ -598,14 +646,31 @@ fn encode_flat_vector_body(
         return Ok(());
     }
     match physical_type {
-        PhysicalType::Varchar => writer.write_field(102, |writer| {
-            writer.write_list(values, |writer, value, _| {
-                writer.write_string_bytes(&encode_string_like_value(logical_type, value))
-            })
-        }),
-        PhysicalType::Struct => encode_struct_vector_body(writer, logical_type, values, count),
-        PhysicalType::List => encode_list_vector_body(writer, logical_type, values),
-        PhysicalType::Array => encode_array_vector_body(writer, logical_type, values),
+        PhysicalType::Varchar => match layout {
+            StringLayout::List => writer.write_field(102, |writer| {
+                writer.write_list(values, |writer, value, _| {
+                    writer.write_string_bytes(&encode_string_like_value(logical_type, value))
+                })
+            }),
+            StringLayout::LengthsAndBytes => {
+                let mut lengths = Vec::with_capacity(values.len() * size_of::<u32>());
+                let mut bytes = Vec::new();
+                for value in values {
+                    let encoded = encode_string_like_value(logical_type, value);
+                    let length = u32::try_from(encoded.len()).map_err(|_| {
+                        QuackError::protocol("string value is longer than u32::MAX bytes")
+                    })?;
+                    lengths.extend_from_slice(&length.to_le_bytes());
+                    bytes.extend_from_slice(&encoded);
+                }
+                write_string_vector_data(writer, &lengths, &bytes)
+            }
+        },
+        PhysicalType::Struct => {
+            encode_struct_vector_body(writer, logical_type, values, count, layout)
+        }
+        PhysicalType::List => encode_list_vector_body(writer, logical_type, values, layout),
+        PhysicalType::Array => encode_array_vector_body(writer, logical_type, values, layout),
         other => Err(QuackError::unsupported(format!(
             "cannot encode physical type {other:?}"
         ))),
@@ -635,11 +700,11 @@ fn read_string_vector_data(
 
     let length_data = reader.read_required_field(108, |reader| reader.read_blob())?;
     let byte_data = reader.read_required_field(109, |reader| reader.read_blob())?;
-    if length_data.len() != count * size_of::<u32>() {
+    if Some(length_data.len()) != count.checked_mul(size_of::<u32>()) {
         return Err(QuackError::protocol(format!(
             "string vector has {} bytes of lengths, expected {} for {count} rows",
             length_data.len(),
-            count * size_of::<u32>()
+            count.saturating_mul(size_of::<u32>())
         )));
     }
     if byte_data.len() as u64 != byte_data_length {
@@ -673,6 +738,19 @@ fn read_string_vector_data(
         )));
     }
     Ok(values)
+}
+
+/// Writes the storage-version-2.0 payload of a string vector: the data length (field 107),
+/// the per-row `u32` lengths (108) and the bytes of the valid rows (109). Invalid rows
+/// must have length 0.
+pub fn write_string_vector_data(
+    writer: &mut BinaryWriter,
+    lengths: &[u8],
+    bytes: &[u8],
+) -> Result<()> {
+    writer.write_field(107, |writer| writer.write_uleb(bytes.len() as u64))?;
+    writer.write_field(108, |writer| writer.write_blob(lengths))?;
+    writer.write_field(109, |writer| writer.write_blob(bytes))
 }
 
 fn decode_fixed_values(
@@ -772,7 +850,7 @@ fn encode_fixed_value(
     value: &Value,
 ) -> Result<()> {
     if value.is_null() {
-        return writer.write_bytes(&vec![0; physical_type_size(physical_type)?]);
+        return write_null_value(writer, physical_type);
     }
     match physical_type {
         PhysicalType::Bool => writer.write_fixed_u8(if matches!(value, Value::Bool(true)) {
@@ -838,6 +916,30 @@ fn encode_fixed_value(
     }
 }
 
+/// Writes what DuckDB stores in a NULL slot (`NullValue<T>()`): the minimum of a
+/// signed type, 0 of an unsigned one, NaN for floats, each field's minimum for an
+/// INTERVAL.
+fn write_null_value(writer: &mut BinaryWriter, physical_type: PhysicalType) -> Result<()> {
+    match physical_type {
+        PhysicalType::Bool | PhysicalType::Int8 => writer.write_fixed_i8(i8::MIN),
+        PhysicalType::Int16 => writer.write_fixed_i16(i16::MIN),
+        PhysicalType::Int32 => writer.write_fixed_i32(i32::MIN),
+        PhysicalType::Int64 => writer.write_fixed_i64(i64::MIN),
+        PhysicalType::Int128 => {
+            writer.write_fixed_u64(0)?;
+            writer.write_fixed_i64(i64::MIN)
+        }
+        PhysicalType::Float => writer.write_fixed_f32(f32::NAN),
+        PhysicalType::Double => writer.write_fixed_f64(f64::NAN),
+        PhysicalType::Interval => {
+            writer.write_fixed_i32(i32::MIN)?;
+            writer.write_fixed_i32(i32::MIN)?;
+            writer.write_fixed_i64(i64::MIN)
+        }
+        other => writer.write_bytes(&vec![0; physical_type_size(other)?]),
+    }
+}
+
 fn decode_string_like_value(logical_type: &LogicalType, raw: Vec<u8>) -> Result<Value> {
     match logical_type.id {
         LogicalTypeId::Blob | LogicalTypeId::Geometry | LogicalTypeId::Bit => Ok(Value::Bytes(raw)),
@@ -865,6 +967,7 @@ fn encode_struct_vector_body(
     logical_type: &LogicalType,
     values: &[Value],
     count: usize,
+    layout: StringLayout,
 ) -> Result<()> {
     let children = get_struct_children(logical_type)?;
     writer.write_field(103, |writer| {
@@ -876,7 +979,7 @@ fn encode_struct_vector_body(
                     _ => Value::Null,
                 })
                 .collect::<Vec<_>>();
-            encode_vector(writer, &child.logical_type, &child_values, count)
+            encode_vector(writer, &child.logical_type, &child_values, count, layout)
         })
     })
 }
@@ -885,6 +988,7 @@ fn encode_list_vector_body(
     writer: &mut BinaryWriter,
     logical_type: &LogicalType,
     values: &[Value],
+    layout: StringLayout,
 ) -> Result<()> {
     let child_type = get_child_type(logical_type)?;
     let mut entries = Vec::with_capacity(values.len());
@@ -909,7 +1013,13 @@ fn encode_list_vector_body(
     writer.write_field(104, |writer| writer.write_uleb(child_values.len() as u64))?;
     writer.write_field(105, |writer| write_list_entries(writer, &entries))?;
     writer.write_field(106, |writer| {
-        encode_vector(writer, child_type, &child_values, child_values.len())
+        encode_vector(
+            writer,
+            child_type,
+            &child_values,
+            child_values.len(),
+            layout,
+        )
     })
 }
 
@@ -917,6 +1027,7 @@ fn encode_array_vector_body(
     writer: &mut BinaryWriter,
     logical_type: &LogicalType,
     values: &[Value],
+    layout: StringLayout,
 ) -> Result<()> {
     let child_type = get_child_type(logical_type)?;
     let array_size = get_array_size(logical_type)? as usize;
@@ -937,12 +1048,20 @@ fn encode_array_vector_body(
     }
     writer.write_field(103, |writer| writer.write_uleb(array_size as u64))?;
     writer.write_field(104, |writer| {
-        encode_vector(writer, child_type, &child_values, child_values.len())
+        encode_vector(
+            writer,
+            child_type,
+            &child_values,
+            child_values.len(),
+            layout,
+        )
     })
 }
 
 fn read_selection_vector(reader: &mut BinaryReader<'_>, count: usize) -> Result<Vec<usize>> {
-    let expected_bytes = count * 4;
+    let expected_bytes = count
+        .checked_mul(4)
+        .ok_or_else(|| QuackError::protocol("selection vector is too large"))?;
     let bytes = reader.read_blob()?;
     if bytes.len() != expected_bytes {
         return Err(QuackError::protocol(format!(
@@ -973,17 +1092,20 @@ fn read_validity_mask(reader: &mut BinaryReader<'_>, count: usize) -> Result<Vec
         .collect())
 }
 
-fn write_validity_mask(validity: &[bool]) -> Vec<u8> {
-    let mut bytes = vec![0u8; validity_mask_size(validity.len())];
+/// Packs row validity into DuckDB's mask: one bit per row, in 64-bit words.
+pub fn write_validity_mask(validity: &[bool]) -> Vec<u8> {
+    // as DuckDB's ValidityMask: all valid, padding included, then the NULLs cleared
+    let mut bytes = vec![0xffu8; validity_mask_size(validity.len())];
     for (index, valid) in validity.iter().enumerate() {
-        if *valid {
-            bytes[index / 8] |= 1 << (index % 8);
+        if !*valid {
+            bytes[index / 8] &= !(1 << (index % 8));
         }
     }
     bytes
 }
 
-fn validity_mask_size(count: usize) -> usize {
+/// Bytes in a DuckDB validity mask for `count` rows.
+pub fn validity_mask_size(count: usize) -> usize {
     count.div_ceil(64) * 8
 }
 
@@ -1337,11 +1459,71 @@ mod tests {
     fn still_decodes_list_string_vector() {
         let values = vec![Value::String("x".into()), Value::Null];
         let mut writer = BinaryWriter::new();
-        encode_vector(&mut writer, &LogicalTypes::varchar(), &values, 2).unwrap();
+        encode_vector(
+            &mut writer,
+            &LogicalTypes::varchar(),
+            &values,
+            2,
+            StringLayout::List,
+        )
+        .unwrap();
         assert_eq!(
             decode(&writer.into_bytes(), &LogicalTypes::varchar(), 2).unwrap(),
             values
         );
+    }
+
+    #[test]
+    fn hostile_list_entries_and_counts_are_errors_not_panics() {
+        // a LIST vector whose entry points past its one child value
+        let mut writer = BinaryWriter::new();
+        writer
+            .write_object(|object| {
+                object.write_field(100, |object| object.write_bool(false))?;
+                object.write_field(104, |object| object.write_uleb(1u64))?;
+                object.write_field(105, |object| {
+                    write_list_entries(
+                        object,
+                        &[ListEntry {
+                            offset: 0,
+                            length: 5,
+                        }],
+                    )
+                })?;
+                object.write_field(106, |object| {
+                    encode_vector(
+                        object,
+                        &LogicalTypes::integer(),
+                        &[Value::Int(1)],
+                        1,
+                        StringLayout::List,
+                    )
+                })
+            })
+            .unwrap();
+        let list = LogicalTypes::list(LogicalTypes::integer());
+        assert!(decode(&writer.into_bytes(), &list, 1).is_err());
+
+        // a string that claims u64::MAX bytes
+        let mut writer = BinaryWriter::new();
+        writer.write_uleb(u64::MAX).unwrap();
+        assert!(BinaryReader::new(writer.as_slice()).read_string().is_err());
+
+        // a list that claims 2^60 elements
+        let mut writer = BinaryWriter::new();
+        writer.write_uleb(1u64 << 60).unwrap();
+        let mut reader = BinaryReader::new(writer.as_slice());
+        assert!(reader.read_list(|reader, _| reader.read_byte()).is_err());
+
+        // a fixed-size vector of usize::MAX rows
+        let mut writer = BinaryWriter::new();
+        writer
+            .write_object(|object| {
+                object.write_field(100, |object| object.write_bool(false))?;
+                object.write_field(102, |object| object.write_blob(&[0; 8]))
+            })
+            .unwrap();
+        assert!(decode(&writer.into_bytes(), &LogicalTypes::bigint(), usize::MAX).is_err());
     }
 
     #[test]

@@ -718,12 +718,34 @@ fn decodes_error_response_with_exception_type_and_extra_info() {
         })
         .unwrap();
 
-    match decode_message_for_version(&writer.into_bytes(), QUACK_V3).unwrap() {
-        QuackMessage::ErrorResponse { message, .. } => {
-            assert_eq!(message, "Catalog Error: Table with name t does not exist!")
+    let bytes = writer.into_bytes();
+    let decoded = decode_message_for_version(&bytes, QUACK_V3).unwrap();
+    match &decoded {
+        QuackMessage::ErrorResponse {
+            message,
+            exception_type,
+            extra_info,
+            must_invalidate,
+            ..
+        } => {
+            assert_eq!(message, "Catalog Error: Table with name t does not exist!");
+            assert_eq!(exception_type.as_deref(), Some("Catalog"));
+            assert_eq!(
+                extra_info,
+                &vec![
+                    ("name".to_string(), "t".to_string()),
+                    ("type".to_string(), "Table".to_string())
+                ]
+            );
+            assert!(*must_invalidate);
         }
         other => panic!("expected ERROR_RESPONSE, got {other:?}"),
     }
+    // and the encoder writes the same bytes back
+    assert_eq!(
+        crate::messages::encode_message_for_version(&decoded, QUACK_V3).unwrap(),
+        bytes
+    );
 }
 
 #[test]
