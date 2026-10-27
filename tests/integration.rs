@@ -574,11 +574,17 @@ async fn live_quack_supports_parameterized_queries() -> Result<()> {
     Ok(())
 }
 
+// APPEND is a protocol v1 message. A v3 session refuses it before sending
+// anything, which a unit test in `client.rs` covers.
 #[tokio::test]
-async fn live_quack_appends_scalar_and_nested_rows() -> Result<()> {
+async fn live_v1_appends_scalar_and_nested_rows() -> Result<()> {
     let Some(client) = live_client().await? else {
         return Ok(());
     };
+    assert_eq!(
+        client.info.as_ref().and_then(|info| info.quack_version),
+        Some(1)
+    );
     let table = unique_name("quack_rust_append");
     // The stream is lazy: DDL only executes once the stream is polled.
     let (_, rows) = client
@@ -1254,11 +1260,16 @@ mod connection_model {
         control.disconnect().await
     }
 
+    // APPEND is a protocol v1 message; see `live_v1_appends_scalar_and_nested_rows`.
     #[tokio::test]
-    async fn live_quack_pool_appends_rows() -> Result<()> {
+    async fn live_v1_pool_appends_rows() -> Result<()> {
         let Some(control) = control().await? else {
             return Ok(());
         };
+        assert_eq!(
+            control.info.as_ref().and_then(|info| info.quack_version),
+            Some(1)
+        );
         let uri = std::env::var("QUACK_SERVER_URI").expect("configured above");
         let pool = QuackPool::connect(&uri, live_options(), QuackPoolOptions::default()).await?;
 
@@ -1344,8 +1355,8 @@ mod arrow_output {
                 &format!(
                     "
             SELECT
-              -- The server binds an untyped NULL literal to INTEGER.
-              NULL AS null_v,
+              -- DuckDB versions type an untyped NULL differently.
+              NULL::INTEGER AS null_v,
               TRUE AS bool_v,
               127::TINYINT AS tiny_v,
               32767::SMALLINT AS small_v,

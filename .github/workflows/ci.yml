@@ -11,8 +11,26 @@ env:
 
 jobs:
   test:
-    name: clippy, tests, and live Quack integration
+    name: clippy, tests, and live Quack integration (DuckDB ${{ matrix.duckdb }})
     runs-on: ubuntu-latest
+    # One pinned server per Quack protocol version the client supports, so a
+    # new DuckDB release cannot change the server under test.
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          # Each server runs the shared live tests and its own version's
+          # (`live_v1_*` or `live_v3_*`), and skips the other version's.
+          - duckdb: v1.5.6
+            cli: duckdb_cli-linux-amd64.zip
+            quack_version: 1
+            skip: live_v3_
+          - duckdb: v2.0.0
+            cli: duckdb-cli-linux-amd64.tar.gz
+            quack_version: 3
+            skip: live_v1_
+    env:
+      QUACK_EXPECTED_VERSION: ${{ matrix.quack_version }}
 
     steps:
       - name: Checkout
@@ -33,13 +51,17 @@ jobs:
           cargo clippy --locked --all-targets --all-features -- -D warnings
 
       - name: Install DuckDB CLI
+        env:
+          DUCKDB_URL: https://github.com/duckdb/duckdb/releases/download/${{ matrix.duckdb }}/${{ matrix.cli }}
         run: |
           set -euo pipefail
-          curl -fsSL \
-            https://github.com/duckdb/duckdb/releases/latest/download/duckdb_cli-linux-amd64.zip \
-            -o "$RUNNER_TEMP/duckdb_cli-linux-amd64.zip"
           mkdir -p "$RUNNER_TEMP/duckdb"
-          unzip -q "$RUNNER_TEMP/duckdb_cli-linux-amd64.zip" -d "$RUNNER_TEMP/duckdb"
+          curl -fsSL "$DUCKDB_URL" -o "$RUNNER_TEMP/${{ matrix.cli }}"
+          # DuckDB 2.0 ships the CLI as a .tar.gz; earlier releases ship a .zip.
+          case "${{ matrix.cli }}" in
+            *.zip) unzip -q "$RUNNER_TEMP/${{ matrix.cli }}" -d "$RUNNER_TEMP/duckdb" ;;
+            *.tar.gz) tar -xzf "$RUNNER_TEMP/${{ matrix.cli }}" -C "$RUNNER_TEMP/duckdb" ;;
+          esac
           chmod +x "$RUNNER_TEMP/duckdb/duckdb"
           echo "$RUNNER_TEMP/duckdb" >> "$GITHUB_PATH"
 
@@ -59,7 +81,7 @@ jobs:
           exit 1
 
       - name: Run tests
-        run: cargo test --locked --all-targets --all-features
+        run: cargo test --locked --all-targets --all-features -- --skip "${{ matrix.skip }}"
 
       - name: Stop local Quack server
         if: always()
@@ -72,6 +94,6 @@ jobs:
         if: failure()
         uses: actions/upload-artifact@v4
         with:
-          name: quack-server-log
+          name: quack-server-log-${{ matrix.duckdb }}
           path: ${{ runner.temp }}/quack-server.log
           if-no-files-found: ignore

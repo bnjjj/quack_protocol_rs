@@ -1407,6 +1407,31 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn append_is_refused_on_v3_before_anything_is_sent() {
+        let (listener, base_url) = listening_socket();
+        let mut connection = test_connection(&base_url);
+        connection.quack_version = QUACK_V3;
+        let chunk = data_chunk_from_rows(
+            &[],
+            Some(vec![crate::ColumnDefinition {
+                name: "id".into(),
+                logical_type: crate::LogicalTypes::integer(),
+            }]),
+        )
+        .unwrap();
+
+        let error = connection
+            .append("t".into(), None, chunk)
+            .await
+            .unwrap_err();
+        assert!(
+            matches!(&error, QuackError::Protocol(message) if message.contains("only supported by Quack protocol v1")),
+            "{error}"
+        );
+        assert!(!connected_within(&listener, Duration::from_millis(200)).await);
+    }
+
+    #[tokio::test]
     async fn dropping_a_closed_connection_sends_nothing() {
         let (listener, base_url) = listening_socket();
         let connection = test_connection(&base_url);
@@ -1485,5 +1510,104 @@ mod tests {
         assert!(error.is_connection_fatal());
         assert!(!error.to_string().contains("private"));
         server.join().unwrap();
+    }
+
+    // Posts raw bytes over a transport of its own, beside the client's session.
+    async fn post_raw(raw: &Transport, bytes: Vec<u8>) -> crate::inspection::ControlResponse {
+        let reply = raw
+            .http
+            .post(format!("{}{}", raw.base_url, QUACK_ENDPOINT))
+            .header(CONTENT_TYPE, HeaderValue::from_static(DUCKDB_MIME_TYPE))
+            .body(bytes)
+            .send()
+            .await
+            .unwrap();
+        assert!(reply.status().is_success(), "{}", reply.status());
+        crate::inspection::inspect_control_response(&reply.bytes().await.unwrap()).unwrap()
+    }
+
+    // Connects to the live server (QUACK_SERVER_URI) and checks that it speaks
+    // `version`. Returns a raw transport beside the client's session and that
+    // session's connection ID. The ID is private to the client, which is why
+    // these tests live here rather than in tests/integration.rs.
+    async fn live_session(version: u64) -> Option<(Transport, QuackClient, String)> {
+        let uri = std::env::var("QUACK_SERVER_URI").ok()?;
+        let options = QuackClientOptions {
+            auth_token: std::env::var("QUACK_AUTH_TOKEN").ok(),
+            ..QuackClientOptions::default()
+        };
+        let raw = Transport::new(&uri, &options).unwrap();
+        let client = QuackClient::connect(&uri, options).await.unwrap();
+        let connection_id = {
+            let connection = client.connection.lock().await;
+            assert_eq!(
+                connection.quack_version, version,
+                "expected a protocol v{version} server"
+            );
+            connection.connection_id.clone()
+        };
+        Some((raw, client, connection_id))
+    }
+
+    // DISCONNECT from outside the client closes its session.
+    async fn assert_disconnect_closes(raw: &Transport, client: &QuackClient, connection_id: &str) {
+        use crate::inspection::{ControlResponse, encode_disconnect};
+        assert_eq!(
+            post_raw(raw, encode_disconnect(connection_id).unwrap()).await,
+            ControlResponse::Success
+        );
+        assert!(client.values("SELECT 1").await.is_err());
+    }
+
+    #[tokio::test]
+    async fn live_v3_cancel_stops_a_running_query() {
+        use crate::inspection::{ControlResponse, encode_cancel};
+        let Some((raw, client, connection_id)) = live_session(QUACK_V3).await else {
+            return;
+        };
+        // CANCEL on an idle session succeeds and does nothing.
+        assert_eq!(
+            post_raw(&raw, encode_cancel(&connection_id).unwrap()).await,
+            ControlResponse::Success
+        );
+
+        // CANCEL repeats until the query stops, because DuckDB ignores one
+        // that arrives before the query thread starts.
+        let running = tokio::spawn({
+            let client = client.clone();
+            async move {
+                client
+                    .execute("SELECT sum(i * i % 7) FROM range(1000000000000) t(i)", None)
+                    .await
+            }
+        });
+        tokio::time::sleep(Duration::from_millis(300)).await;
+        let deadline = tokio::time::Instant::now() + Duration::from_secs(30);
+        while !running.is_finished() {
+            assert!(tokio::time::Instant::now() < deadline, "query kept running");
+            assert_eq!(
+                post_raw(&raw, encode_cancel(&connection_id).unwrap()).await,
+                ControlResponse::Success
+            );
+            tokio::time::sleep(Duration::from_millis(100)).await;
+        }
+        let error = running.await.unwrap().unwrap_err();
+        assert!(error.to_string().contains("Interrupt"), "{error}");
+
+        assert_disconnect_closes(&raw, &client, &connection_id).await;
+    }
+
+    #[tokio::test]
+    async fn live_v1_refuses_cancel() {
+        use crate::inspection::{ControlResponse, encode_cancel};
+        let Some((raw, client, connection_id)) = live_session(QUACK_V1).await else {
+            return;
+        };
+        // Protocol v1 has no CANCEL, so the server refuses it.
+        assert_eq!(
+            post_raw(&raw, encode_cancel(&connection_id).unwrap()).await,
+            ControlResponse::Error { fatal: false }
+        );
+        assert_disconnect_closes(&raw, &client, &connection_id).await;
     }
 }
