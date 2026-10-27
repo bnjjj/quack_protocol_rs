@@ -252,7 +252,7 @@ heartbeats. The v3 send-data write path is not implemented yet, so `append` and
 `append_rows` return an explicit unsupported-protocol error on a v3 connection;
 they continue to work on v1 connections.
 
-## Admission-aware proxies
+## Raw messages and errors
 
 `inspection::inspect_message_header` reads only a bounded Quack header and
 distinguishes incomplete, invalid, and oversized input. It returns an
@@ -262,11 +262,21 @@ Callers must cap collection at `MAX_MESSAGE_HEADER_BYTES` and replay the inspect
 bytes.
 `inspect_control_response` accepts only bounded complete connect, success, and
 error responses, including DuckDB's structured invalidation flag. Fatality is a
-conservative retirement signal and never authorizes replay.
+conservative retirement signal and never authorizes replay. A connect response
+also carries the heartbeat timeout DuckDB agreed to (`None` on protocol v1): how
+long the session may stay silent before it expires.
 
-The client decodes recognized structured proxy HTTP failures as
-`QuackError::Proxy(ProxyError)`. This is a new error variant: exhaustive error
-matches must handle it. Unknown or oversized failures remain generic protocol
-errors; raw proxy messages are discarded. Supply assignment and lifecycle headers
-through `QuackClientOptions::headers`; the transport sends them on every request,
+For code that holds a connection ID but no `QuackClient`,
+`inspection::encode_cancel` and `inspection::encode_disconnect` build a CANCEL
+for whatever runs on that connection and a DISCONNECT. Neither carries
+credentials.
+
+A non-success HTTP reply surfaces as `QuackError::HttpStatus { status, body }`
+(also `QuackError::http_status()`). It may come from the Quack server or from
+something in front of it, such as a proxy, and either can carry its own errors
+in the body. The crate does not interpret the body; callers that know its format
+parse it. It is raw and untrusted, empty above 16 KiB, and never printed. HTTP failures
+with no reply surface as `QuackError::Transport { kind, .. }`, where `kind` is
+`Connect`, `Timeout`, or `Other`. Supply extra headers through
+`QuackClientOptions::headers`; the transport sends them on every request,
 including heartbeat and disconnect. Debug output redacts these headers.

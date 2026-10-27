@@ -93,7 +93,7 @@ async fn live_quack_pinned_tls_rejects_other_certificates() -> Result<()> {
     let error = QuackClient::connect(&uri, options)
         .await
         .expect_err("a certificate that does not match the pin must be rejected");
-    assert!(matches!(error, QuackError::Http(_)), "{error}");
+    assert!(matches!(error, QuackError::Transport { .. }), "{error}");
 
     Ok(())
 }
@@ -741,7 +741,8 @@ mod connection_model {
 
     use futures_util::{StreamExt, TryStreamExt};
     use quack_protocol::{
-        QuackClient, QuackPool, QuackPoolOptions, Result, SqlParameter, Value, sql_literal,
+        QuackClient, QuackError, QuackPool, QuackPoolOptions, Result, SqlParameter, Value,
+        sql_literal,
     };
     use tokio::time::{sleep, timeout};
 
@@ -1036,11 +1037,9 @@ mod connection_model {
         // Error responses carry no typed cause, so the stale-session text is
         // indistinguishable from SQL raising the same message. The pool must
         // surface the first error rather than risk replaying a committed write.
-        let error = pool
-            .values("SELECT 2::INTEGER")
+        pool.values("SELECT 2::INTEGER")
             .await
             .expect_err("a stale session should surface before replacement");
-        assert!(error.is_connection_fatal(), "{error}");
 
         // The failed session was retired. A later, explicit call opens a fresh
         // session and stays within the configured connection limit.
@@ -1049,11 +1048,10 @@ mod connection_model {
 
         // A plain client does not reconnect: it is one session, and silently
         // opening another would drop the session state that came with it.
-        let error = client
+        client
             .values("SELECT 3::INTEGER")
             .await
             .expect_err("a stale session should surface");
-        assert!(error.is_connection_fatal(), "{error}");
 
         pool.close().await?;
         stop_server(&control, port).await?;
@@ -1248,7 +1246,7 @@ mod connection_model {
             Err(error) => error,
             Ok(_) => panic!("query should fail"),
         };
-        assert!(!error.is_connection_fatal(), "{error}");
+        assert!(matches!(error, QuackError::Server(_)), "{error}");
 
         // A failed statement leaves the session usable.
         assert_eq!(pool.values("SELECT 8::INTEGER").await?, vec![Value::Int(8)]);

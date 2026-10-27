@@ -16,7 +16,7 @@ use crate::constants::{
     MAX_HEARTBEAT_TIMEOUT_SECS, MAX_QUACK_VERSION, MIN_QUACK_VERSION, QUACK_ENDPOINT, QUACK_V1,
     QUACK_V3,
 };
-use crate::errors::{QuackError, Result};
+use crate::errors::{MAX_HTTP_STATUS_BODY_BYTES, QuackError, Result};
 use crate::messages::{
     MessageHeader, MessageType, QuackMessage, decode_message_for_version,
     encode_message_for_version,
@@ -240,31 +240,8 @@ pub struct QuackClient {
 
 impl QuackClient {
     pub async fn connect(uri: &str, options: QuackClientOptions) -> Result<Self> {
-        let pin = options
-            .ssl_fingerprint
-            .as_deref()
-            .map(CertificatePin::parse)
-            .transpose()?;
-        if pin.is_some() && options.ssl == Some(false) {
-            return Err(QuackError::protocol(
-                "ssl_fingerprint requires HTTPS, but ssl is set to false",
-            ));
-        }
-        let ssl = if pin.is_some() {
-            Some(true)
-        } else {
-            options.ssl
-        };
-        let parsed = parse_quack_uri(uri, ssl)?;
-        if pin.is_some() && !parsed.ssl {
-            return Err(QuackError::protocol(format!(
-                "ssl_fingerprint requires HTTPS, but {uri} is an http URL"
-            )));
-        }
-        let timeout = options.timeout.unwrap_or(DEFAULT_QUACK_REQUEST_TIMEOUT);
-        let http = http_client(parsed.ssl, pin, timeout)?;
-        let base_url = parsed.base_url.trim_end_matches('/').to_string();
-        let (connection, info) = Connection::connect(base_url, http, timeout, options).await?;
+        let transport = Transport::new(uri, &options)?;
+        let (connection, info) = Connection::connect(transport, options).await?;
         let state = Arc::clone(&connection.state);
         let heartbeat = info
             .heartbeat_timeout
@@ -584,9 +561,7 @@ struct Connection {
 
 impl Connection {
     async fn connect(
-        base_url: String,
-        http: reqwest::Client,
-        timeout: Duration,
+        transport: Transport,
         options: QuackClientOptions,
     ) -> Result<(Self, QuackConnectionInfo)> {
         let min_version = options
@@ -617,13 +592,6 @@ impl Connection {
         if versions.contains(&QUACK_V3) {
             validate_heartbeat_timeout(heartbeat_timeout_seconds)?;
         }
-        let transport = Transport {
-            base_url,
-            http,
-            headers: header_map(&options.headers)?,
-            timeout,
-        };
-
         let mut previous_error = None;
         for (index, quack_version) in versions.iter().copied().enumerate() {
             let response = transport
@@ -888,6 +856,37 @@ struct Transport {
 }
 
 impl Transport {
+    fn new(uri: &str, options: &QuackClientOptions) -> Result<Self> {
+        let pin = options
+            .ssl_fingerprint
+            .as_deref()
+            .map(CertificatePin::parse)
+            .transpose()?;
+        if pin.is_some() && options.ssl == Some(false) {
+            return Err(QuackError::protocol(
+                "ssl_fingerprint requires HTTPS, but ssl is set to false",
+            ));
+        }
+        let ssl = if pin.is_some() {
+            Some(true)
+        } else {
+            options.ssl
+        };
+        let parsed = parse_quack_uri(uri, ssl)?;
+        if pin.is_some() && !parsed.ssl {
+            return Err(QuackError::protocol(format!(
+                "ssl_fingerprint requires HTTPS, but {uri} is an http URL"
+            )));
+        }
+        let timeout = options.timeout.unwrap_or(DEFAULT_QUACK_REQUEST_TIMEOUT);
+        Ok(Self {
+            base_url: parsed.base_url.trim_end_matches('/').to_string(),
+            http: http_client(parsed.ssl, pin, timeout)?,
+            headers: header_map(&options.headers)?,
+            timeout,
+        })
+    }
+
     async fn send(&self, message: &QuackMessage, quack_version: u64) -> Result<QuackMessage> {
         let bytes = encode_message_for_version(message, quack_version)?;
         let mut request = self
@@ -900,27 +899,20 @@ impl Transport {
             request = request.headers(self.headers.clone());
         }
         request = request.timeout(self.timeout);
-        let mut response = request.send().await?;
+        let mut response = request.send().await.map_err(QuackError::transport)?;
         if !response.status().is_success() {
-            let status = response.status();
+            let status = response.status().as_u16();
             let mut body = Vec::new();
-            while let Some(chunk) = response.chunk().await? {
-                if chunk.len() > 16 * 1024 - body.len() {
+            while let Some(chunk) = response.chunk().await.map_err(QuackError::transport)? {
+                if chunk.len() > MAX_HTTP_STATUS_BODY_BYTES - body.len() {
                     body.clear();
                     break;
                 }
                 body.extend_from_slice(&chunk);
             }
-            if let Some(error) = crate::ProxyError::decode(status.as_u16(), &body) {
-                return Err(error.into());
-            }
-            return Err(QuackError::protocol(format!(
-                "Quack HTTP request failed with {} {}",
-                response.status().as_u16(),
-                response.status().canonical_reason().unwrap_or("")
-            )));
+            return Err(QuackError::HttpStatus { status, body });
         }
-        let bytes = response.bytes().await?;
+        let bytes = response.bytes().await.map_err(QuackError::transport)?;
         let decoded = decode_message_for_version(&bytes, quack_version)?;
         if let QuackMessage::ErrorResponse { message, .. } = decoded {
             return Err(QuackError::server(message));
@@ -1116,7 +1108,7 @@ fn http_client(
     if let Some(pin) = pin {
         http = http.use_preconfigured_tls(pinned_client_config(pin)?);
     }
-    Ok(http.build()?)
+    http.build().map_err(QuackError::transport)
 }
 
 pub(crate) fn parse_quack_uri(input: &str, ssl_override: Option<bool>) -> Result<ParsedQuackUri> {
@@ -1441,7 +1433,7 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn structured_proxy_failure_is_decoded_by_transport() {
+    async fn non_success_reply_keeps_its_status_and_raw_body() {
         use std::io::{Read, Write};
         let (listener, uri) = listening_socket();
         listener.set_nonblocking(false).unwrap();
@@ -1453,8 +1445,7 @@ mod tests {
             let mut request = [0; 4096];
             let count = socket.read(&mut request).unwrap();
             assert!(
-                String::from_utf8_lossy(&request[..count])
-                    .contains("x-quaxy-assignment-id: example")
+                String::from_utf8_lossy(&request[..count]).contains("x-example-header: example")
             );
             let body = r#"{"error":{"code":"at_capacity","message":"private details"}}"#;
             write!(socket, "HTTP/1.1 429 Too Many Requests\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{}", body.len(), body).unwrap();
@@ -1462,7 +1453,7 @@ mod tests {
         let transport = Transport {
             base_url: uri,
             http: reqwest::Client::new(),
-            headers: header_map(&[("x-quaxy-assignment-id".into(), "example".into())]).unwrap(),
+            headers: header_map(&[("x-example-header".into(), "example".into())]).unwrap(),
             timeout: Duration::from_secs(3),
         };
         let result = transport
@@ -1477,10 +1468,110 @@ mod tests {
                 QUACK_V3,
             )
             .await;
-        assert!(matches!(
-            result,
-            Err(QuackError::Proxy(crate::ProxyError::AtCapacity))
-        ));
+        let error = result.unwrap_err();
+        assert_eq!(
+            error.http_status(),
+            Some((
+                429,
+                br#"{"error":{"code":"at_capacity","message":"private details"}}"#.as_slice()
+            ))
+        );
+        assert!(error.is_connection_fatal());
+        assert!(!error.to_string().contains("private"));
         server.join().unwrap();
+    }
+
+    // Posts raw bytes over a transport of its own, beside any client session.
+    async fn post_raw(raw: &Transport, bytes: Vec<u8>) -> crate::inspection::ControlResponse {
+        let reply = raw
+            .http
+            .post(format!("{}{}", raw.base_url, QUACK_ENDPOINT))
+            .header(CONTENT_TYPE, HeaderValue::from_static(DUCKDB_MIME_TYPE))
+            .body(bytes)
+            .send()
+            .await
+            .unwrap();
+        assert!(reply.status().is_success(), "{}", reply.status());
+        crate::inspection::inspect_control_response(&reply.bytes().await.unwrap()).unwrap()
+    }
+
+    // Runs only against a live server (QUACK_SERVER_URI). The connection ID is
+    // private to the client, so this cannot live in tests/integration.rs.
+    #[tokio::test]
+    async fn live_control_messages_stop_and_close_a_real_session() {
+        use crate::inspection::{ControlResponse, encode_cancel, encode_disconnect};
+        let Ok(uri) = std::env::var("QUACK_SERVER_URI") else {
+            return;
+        };
+        let options = QuackClientOptions {
+            auth_token: std::env::var("QUACK_AUTH_TOKEN").ok(),
+            heartbeat_timeout: Some(Duration::from_secs(15)),
+            ..QuackClientOptions::default()
+        };
+        let raw = Transport::new(&uri, &options).unwrap();
+
+        // The agreed heartbeat timeout is read from a real CONNECT reply.
+        let connect = crate::messages::encode_message_for_version(
+            &QuackMessage::ConnectionRequest {
+                header: MessageHeader::new(MessageType::ConnectionRequest),
+                auth_string: options.auth_token.clone(),
+                client_duckdb_version: None,
+                client_platform: Some("quack-rust".into()),
+                min_supported_quack_version: QUACK_V3,
+                max_supported_quack_version: QUACK_V3,
+                client_id: None,
+                heartbeat_timeout_seconds: 15,
+            },
+            QUACK_V3,
+        )
+        .unwrap();
+        let ControlResponse::Connected {
+            connection_id,
+            heartbeat_timeout,
+        } = post_raw(&raw, connect).await
+        else {
+            panic!("expected a connect response");
+        };
+        assert_eq!(heartbeat_timeout, Some(Duration::from_secs(15)));
+        // CANCEL on an idle connection succeeds and does nothing.
+        assert_eq!(
+            post_raw(&raw, encode_cancel(&connection_id).unwrap()).await,
+            ControlResponse::Success
+        );
+        assert_eq!(
+            post_raw(&raw, encode_disconnect(&connection_id).unwrap()).await,
+            ControlResponse::Success
+        );
+
+        // A running query stops. CANCEL repeats until it does, because DuckDB
+        // ignores one that arrives before the query thread starts.
+        let client = QuackClient::connect(&uri, options).await.unwrap();
+        let connection_id = client.connection.lock().await.connection_id.clone();
+        let running = tokio::spawn({
+            let client = client.clone();
+            async move {
+                client
+                    .execute("SELECT sum(i * i % 7) FROM range(1000000000000) t(i)", None)
+                    .await
+            }
+        });
+        tokio::time::sleep(Duration::from_millis(300)).await;
+        let deadline = tokio::time::Instant::now() + Duration::from_secs(30);
+        while !running.is_finished() {
+            assert!(tokio::time::Instant::now() < deadline, "query kept running");
+            assert_eq!(
+                post_raw(&raw, encode_cancel(&connection_id).unwrap()).await,
+                ControlResponse::Success
+            );
+            tokio::time::sleep(Duration::from_millis(100)).await;
+        }
+        let error = running.await.unwrap().unwrap_err();
+        assert!(error.to_string().contains("Interrupt"), "{error}");
+
+        assert_eq!(
+            post_raw(&raw, encode_disconnect(&connection_id).unwrap()).await,
+            ControlResponse::Success
+        );
+        assert!(client.values("SELECT 1").await.is_err());
     }
 }
