@@ -1,14 +1,20 @@
-//! Bounded metadata inspection for HTTP proxies. Payloads remain opaque.
+//! Bounded metadata inspection of raw Quack messages. Payloads remain opaque.
 //!
 //! Headers share the client's codec. Incomplete input is distinct from invalid
 //! input; callers must stop collecting at [`MAX_MESSAGE_HEADER_BYTES`]. Neither this
 //! API nor its errors expose SQL, authentication fields, or upstream error text.
+//!
+//! Code that holds a connection ID but no client can also build the control
+//! messages that stop and close it: [`encode_cancel`] and [`encode_disconnect`].
+
+use std::time::Duration;
 
 pub use crate::messages::MessageType as Operation;
 use crate::{
     QuackError,
-    binary::BinaryReader,
-    messages::{self, QuackMessage},
+    binary::{BinaryReader, HugeIntParts},
+    constants::{MAX_HEARTBEAT_TIMEOUT_SECS, QUACK_V3},
+    messages::{self, MessageHeader as WireHeader, QuackMessage},
 };
 
 pub const MAX_MESSAGE_HEADER_BYTES: usize = 4096;
@@ -64,12 +70,59 @@ pub fn inspect_message_header(prefix: &[u8]) -> Result<MessageHeader, Inspection
     })
 }
 
+/// Encodes a CANCEL for whatever query runs on `connection_id`.
+///
+/// CANCEL exists only in protocol v3; a v1 server answers it with an error.
+/// A v3 server answers SUCCESS whether or not a query was running. The message
+/// carries no credentials and no query number.
+pub fn encode_cancel(connection_id: &str) -> Result<Vec<u8>, InspectionError> {
+    encode_v3(QuackMessage::Cancel {
+        header: control_header(Operation::CancelRequest, connection_id)?,
+        query_uuid: HugeIntParts { upper: 0, lower: 0 },
+    })
+}
+
+/// Encodes a DISCONNECT that closes `connection_id` on a v1 or v3 server.
+pub fn encode_disconnect(connection_id: &str) -> Result<Vec<u8>, InspectionError> {
+    encode_v3(QuackMessage::Disconnect {
+        header: control_header(Operation::DisconnectMessage, connection_id)?,
+    })
+}
+
+// An empty ID would encode as a message with no connection at all.
+fn control_header(
+    operation: Operation,
+    connection_id: &str,
+) -> Result<WireHeader, InspectionError> {
+    if connection_id.is_empty() {
+        return Err(InspectionError::Invalid);
+    }
+    if connection_id.len() > MAX_CONNECTION_ID_BYTES {
+        return Err(InspectionError::TooLarge);
+    }
+    Ok(WireHeader::new(operation).with_connection(connection_id))
+}
+
+// The header is the same in v1 and v3, and so is DISCONNECT's empty body, so
+// a v1 server reads a v3 DISCONNECT. CANCEL exists only in v3.
+fn encode_v3(message: QuackMessage) -> Result<Vec<u8>, InspectionError> {
+    messages::encode_message_for_version(&message, QUACK_V3).map_err(|_| InspectionError::Invalid)
+}
+
 /// Only bounded control responses are decoded. Never call on result payloads.
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub enum ControlResponse {
-    Connected { connection_id: String },
+    Connected {
+        connection_id: String,
+        /// The heartbeat lease DuckDB agreed to: a session silent for longer
+        /// expires. `None` for protocol v1, which has no heartbeats, and for a
+        /// v3 reply whose value is missing or out of range.
+        heartbeat_timeout: Option<Duration>,
+    },
     Success,
-    Error { fatal: bool },
+    Error {
+        fatal: bool,
+    },
 }
 
 pub fn inspect_control_response(bytes: &[u8]) -> Result<ControlResponse, InspectionError> {
@@ -106,13 +159,21 @@ pub fn inspect_control_response(bytes: &[u8]) -> Result<ControlResponse, Inspect
         QuackMessage::ConnectionResponse {
             header,
             quack_version,
+            heartbeat_timeout_seconds,
             ..
         } => {
             if quack_version.is_some_and(|v| v != 1 && v != 3) {
                 return Err(InspectionError::Invalid);
             }
+            let heartbeat_timeout = heartbeat_timeout_seconds
+                .filter(|seconds| {
+                    quack_version == Some(QUACK_V3)
+                        && (1..=MAX_HEARTBEAT_TIMEOUT_SECS).contains(seconds)
+                })
+                .map(Duration::from_secs);
             Ok(ControlResponse::Connected {
                 connection_id: header.connection_id.ok_or(InspectionError::Invalid)?,
+                heartbeat_timeout,
             })
         }
         QuackMessage::SuccessResponse { .. } => Ok(ControlResponse::Success),
@@ -222,6 +283,85 @@ mod tests {
                 ControlResponse::Error { fatal }
             );
         }
+    }
+
+    #[test]
+    fn control_messages_name_the_connection_and_decode_as_sent() {
+        let cancel = encode_cancel("connection-example").unwrap();
+        let header = inspect_message_header(&cancel).unwrap();
+        assert_eq!(header.operation, Operation::CancelRequest);
+        assert_eq!(header.connection_id.as_deref(), Some("connection-example"));
+        assert_eq!(header.client_query_id, None);
+        assert!(matches!(
+            messages::decode_message_for_version(&cancel, QUACK_V3).unwrap(),
+            QuackMessage::Cancel {
+                query_uuid: HugeIntParts { upper: 0, lower: 0 },
+                ..
+            }
+        ));
+        // Protocol v1 has no CANCEL.
+        assert!(messages::decode_message_for_version(&cancel, crate::constants::QUACK_V1).is_err());
+        assert!(
+            messages::encode_message_for_version(
+                &messages::decode_message(&cancel).unwrap(),
+                crate::constants::QUACK_V1
+            )
+            .is_err()
+        );
+
+        let disconnect = encode_disconnect("connection-example").unwrap();
+        let header = inspect_message_header(&disconnect).unwrap();
+        assert_eq!(header.operation, Operation::DisconnectMessage);
+        assert_eq!(header.connection_id.as_deref(), Some("connection-example"));
+        assert!(matches!(
+            messages::decode_message_for_version(&disconnect, crate::constants::QUACK_V1).unwrap(),
+            QuackMessage::Disconnect { .. }
+        ));
+    }
+
+    #[test]
+    fn control_messages_reject_missing_and_oversized_connection_ids() {
+        for encode in [encode_cancel, encode_disconnect] {
+            assert_eq!(encode(""), Err(InspectionError::Invalid));
+            assert_eq!(
+                encode(&"x".repeat(MAX_CONNECTION_ID_BYTES + 1)),
+                Err(InspectionError::TooLarge)
+            );
+            assert!(encode(&"x".repeat(MAX_CONNECTION_ID_BYTES)).is_ok());
+        }
+    }
+
+    #[test]
+    fn connected_reports_the_agreed_heartbeat_timeout_only_for_v3() {
+        let connected = |quack_version, heartbeat_timeout_seconds| {
+            let bytes = encode_message(&QuackMessage::ConnectionResponse {
+                header: header(Operation::ConnectionResponse, Some("example")),
+                server_duckdb_version: None,
+                server_platform: None,
+                quack_version,
+                heartbeat_timeout_seconds,
+            })
+            .unwrap();
+            match inspect_control_response(&bytes).unwrap() {
+                ControlResponse::Connected {
+                    connection_id,
+                    heartbeat_timeout,
+                } => {
+                    assert_eq!(connection_id, "example");
+                    heartbeat_timeout
+                }
+                other => panic!("unexpected {other:?}"),
+            }
+        };
+        assert_eq!(connected(Some(3), Some(15)), Some(Duration::from_secs(15)));
+        assert_eq!(connected(Some(3), None), None);
+        assert_eq!(connected(Some(3), Some(0)), None);
+        assert_eq!(
+            connected(Some(3), Some(MAX_HEARTBEAT_TIMEOUT_SECS + 1)),
+            None
+        );
+        assert_eq!(connected(Some(1), Some(15)), None);
+        assert_eq!(connected(None, Some(15)), None);
     }
 
     #[test]

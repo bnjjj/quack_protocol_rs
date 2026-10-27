@@ -14,8 +14,6 @@ mod builders;
 mod client;
 mod constants;
 mod errors;
-mod proxy_error;
-pub use proxy_error::ProxyError;
 pub mod inspection;
 mod json;
 mod logical_types;
@@ -30,7 +28,7 @@ pub use builders::{ColumnDefinition, ColumnInput, column, data_chunk, data_chunk
 pub use client::{
     QuackClient, QuackClientOptions, QuackConnectionInfo, QuackResultStream, QueryMetadata,
 };
-pub use errors::{QuackError, Result};
+pub use errors::{QuackError, Result, TransportErrorKind};
 pub use futures_core::Stream;
 pub use json::{
     BigIntJsonMode, BytesJsonMode, JsonOptions, TaggedJsonMode, to_json_row, to_json_rows,

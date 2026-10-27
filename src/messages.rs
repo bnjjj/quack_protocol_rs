@@ -143,6 +143,11 @@ pub(crate) enum QuackMessage {
     Disconnect {
         header: MessageHeader,
     },
+    /// A zero `query_uuid` cancels whatever runs on the connection.
+    Cancel {
+        header: MessageHeader,
+        query_uuid: HugeIntParts,
+    },
     ErrorResponse {
         header: MessageHeader,
         message: String,
@@ -162,6 +167,7 @@ impl QuackMessage {
             | Self::AppendRequest { header, .. }
             | Self::SuccessResponse { header }
             | Self::Disconnect { header }
+            | Self::Cancel { header, .. }
             | Self::ErrorResponse { header, .. } => header,
         }
     }
@@ -350,6 +356,9 @@ fn encode_body_v1(writer: &mut BinaryWriter, message: &QuackMessage) -> Result<(
         QuackMessage::SuccessResponse { .. } | QuackMessage::Disconnect { .. } => {
             writer.write_object(|_| Ok(()))
         }
+        QuackMessage::Cancel { .. } => Err(QuackError::protocol(
+            "CANCEL_REQUEST is not supported by Quack protocol v1",
+        )),
         QuackMessage::ErrorResponse { message, .. } => writer.write_object(|object| {
             write_optional_string(object, 1, Some(message))?;
             Ok(())
@@ -481,6 +490,9 @@ fn encode_body_v3(writer: &mut BinaryWriter, message: &QuackMessage) -> Result<(
         QuackMessage::SuccessResponse { .. }
         | QuackMessage::Disconnect { .. }
         | QuackMessage::HeartbeatRequest { .. } => writer.write_object(|_| Ok(())),
+        QuackMessage::Cancel { query_uuid, .. } => writer.write_object(|object| {
+            object.write_field(1, |object| object.write_huge_int_parts(*query_uuid))
+        }),
         QuackMessage::ErrorResponse { message, .. } => writer.write_object(|object| {
             write_optional_string(object, 1, Some(message))?;
             Ok(())
@@ -725,6 +737,12 @@ fn decode_body_v3(reader: &mut BinaryReader<'_>, header: MessageHeader) -> Resul
         MessageType::DisconnectMessage => {
             reader.read_object(|_| Ok(QuackMessage::Disconnect { header }))
         }
+        MessageType::CancelRequest => reader.read_object(|object| {
+            Ok(QuackMessage::Cancel {
+                header,
+                query_uuid: object.read_required_field(1, |object| object.read_huge_int_parts())?,
+            })
+        }),
         MessageType::HeartbeatRequest => {
             reader.read_object(|_| Ok(QuackMessage::HeartbeatRequest { header }))
         }
@@ -813,7 +831,7 @@ fn read_error_message(object: &mut BinaryReader<'_>) -> Result<String> {
     read_error_fields(object).map(|(message, _)| message)
 }
 
-// Share error decoding with bounded proxy inspection. Do not preallocate using
+// Share error decoding with bounded inspection. Do not preallocate using
 // the untrusted extra-info count: malformed input must fail before allocation.
 pub(crate) fn read_error_fields(object: &mut BinaryReader<'_>) -> Result<(String, bool)> {
     let message = object.read_optional_field(1, |object| object.read_string(), String::new())?;
