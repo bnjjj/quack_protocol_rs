@@ -269,9 +269,14 @@ fn protocol_v1_connection_request_omits_v3_lease_fields() {
 
 #[test]
 fn negotiation_retries_v1_for_legacy_handshake_failures_but_not_authentication() {
-    assert!(is_version_negotiation_error(&QuackError::Protocol(
-        "Quack HTTP request failed with 500 Internal Server Error".to_string(),
-    )));
+    assert!(is_version_negotiation_error(&QuackError::HttpStatus {
+        status: 500,
+        body: Vec::new(),
+    }));
+    assert!(!is_version_negotiation_error(&QuackError::HttpStatus {
+        status: 503,
+        body: Vec::new(),
+    }));
     assert!(is_version_negotiation_error(&QuackError::Server(
         "Unsupported Quack version - server only supports version 1 of quack".to_string(),
     )));

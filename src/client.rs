@@ -16,7 +16,7 @@ use crate::constants::{
     MAX_HEARTBEAT_TIMEOUT_SECS, MAX_QUACK_VERSION, MIN_QUACK_VERSION, QUACK_ENDPOINT, QUACK_V1,
     QUACK_V3,
 };
-use crate::errors::{QuackError, Result};
+use crate::errors::{MAX_HTTP_STATUS_BODY_BYTES, QuackError, Result};
 use crate::messages::{
     MessageHeader, MessageType, QuackMessage, decode_message_for_version,
     encode_message_for_version,
@@ -240,31 +240,8 @@ pub struct QuackClient {
 
 impl QuackClient {
     pub async fn connect(uri: &str, options: QuackClientOptions) -> Result<Self> {
-        let pin = options
-            .ssl_fingerprint
-            .as_deref()
-            .map(CertificatePin::parse)
-            .transpose()?;
-        if pin.is_some() && options.ssl == Some(false) {
-            return Err(QuackError::protocol(
-                "ssl_fingerprint requires HTTPS, but ssl is set to false",
-            ));
-        }
-        let ssl = if pin.is_some() {
-            Some(true)
-        } else {
-            options.ssl
-        };
-        let parsed = parse_quack_uri(uri, ssl)?;
-        if pin.is_some() && !parsed.ssl {
-            return Err(QuackError::protocol(format!(
-                "ssl_fingerprint requires HTTPS, but {uri} is an http URL"
-            )));
-        }
-        let timeout = options.timeout.unwrap_or(DEFAULT_QUACK_REQUEST_TIMEOUT);
-        let http = http_client(parsed.ssl, pin, timeout)?;
-        let base_url = parsed.base_url.trim_end_matches('/').to_string();
-        let (connection, info) = Connection::connect(base_url, http, timeout, options).await?;
+        let transport = Transport::new(uri, &options)?;
+        let (connection, info) = Connection::connect(transport, options).await?;
         let state = Arc::clone(&connection.state);
         let heartbeat = info
             .heartbeat_timeout
@@ -584,9 +561,7 @@ struct Connection {
 
 impl Connection {
     async fn connect(
-        base_url: String,
-        http: reqwest::Client,
-        timeout: Duration,
+        transport: Transport,
         options: QuackClientOptions,
     ) -> Result<(Self, QuackConnectionInfo)> {
         let min_version = options
@@ -617,13 +592,6 @@ impl Connection {
         if versions.contains(&QUACK_V3) {
             validate_heartbeat_timeout(heartbeat_timeout_seconds)?;
         }
-        let transport = Transport {
-            base_url,
-            http,
-            headers: header_map(&options.headers)?,
-            timeout,
-        };
-
         let mut previous_error = None;
         for (index, quack_version) in versions.iter().copied().enumerate() {
             let response = transport
@@ -888,6 +856,37 @@ struct Transport {
 }
 
 impl Transport {
+    fn new(uri: &str, options: &QuackClientOptions) -> Result<Self> {
+        let pin = options
+            .ssl_fingerprint
+            .as_deref()
+            .map(CertificatePin::parse)
+            .transpose()?;
+        if pin.is_some() && options.ssl == Some(false) {
+            return Err(QuackError::protocol(
+                "ssl_fingerprint requires HTTPS, but ssl is set to false",
+            ));
+        }
+        let ssl = if pin.is_some() {
+            Some(true)
+        } else {
+            options.ssl
+        };
+        let parsed = parse_quack_uri(uri, ssl)?;
+        if pin.is_some() && !parsed.ssl {
+            return Err(QuackError::protocol(format!(
+                "ssl_fingerprint requires HTTPS, but {uri} is an http URL"
+            )));
+        }
+        let timeout = options.timeout.unwrap_or(DEFAULT_QUACK_REQUEST_TIMEOUT);
+        Ok(Self {
+            base_url: parsed.base_url.trim_end_matches('/').to_string(),
+            http: http_client(parsed.ssl, pin, timeout)?,
+            headers: header_map(&options.headers)?,
+            timeout,
+        })
+    }
+
     async fn send(&self, message: &QuackMessage, quack_version: u64) -> Result<QuackMessage> {
         let bytes = encode_message_for_version(message, quack_version)?;
         let mut request = self
@@ -900,27 +899,25 @@ impl Transport {
             request = request.headers(self.headers.clone());
         }
         request = request.timeout(self.timeout);
-        let mut response = request.send().await?;
+        let mut response = request.send().await.map_err(QuackError::transport)?;
+        // Every non-success reply is returned as it arrived, whoever sent it.
+        // The Quack server's own HTTP failures are bare statuses, while
+        // something in front of it, such as a proxy, may put its own error in
+        // the body. Only the caller knows that format, so the crate keeps the
+        // status and raw body and leaves decoding to it.
         if !response.status().is_success() {
-            let status = response.status();
+            let status = response.status().as_u16();
             let mut body = Vec::new();
-            while let Some(chunk) = response.chunk().await? {
-                if chunk.len() > 16 * 1024 - body.len() {
+            while let Some(chunk) = response.chunk().await.map_err(QuackError::transport)? {
+                if chunk.len() > MAX_HTTP_STATUS_BODY_BYTES - body.len() {
                     body.clear();
                     break;
                 }
                 body.extend_from_slice(&chunk);
             }
-            if let Some(error) = crate::ProxyError::decode(status.as_u16(), &body) {
-                return Err(error.into());
-            }
-            return Err(QuackError::protocol(format!(
-                "Quack HTTP request failed with {} {}",
-                response.status().as_u16(),
-                response.status().canonical_reason().unwrap_or("")
-            )));
+            return Err(QuackError::HttpStatus { status, body });
         }
-        let bytes = response.bytes().await?;
+        let bytes = response.bytes().await.map_err(QuackError::transport)?;
         let decoded = decode_message_for_version(&bytes, quack_version)?;
         if let QuackMessage::ErrorResponse { message, .. } = decoded {
             return Err(QuackError::server(message));
@@ -1089,12 +1086,13 @@ fn validate_heartbeat_timeout(seconds: u64) -> Result<()> {
 pub(crate) fn is_version_negotiation_error(error: &QuackError) -> bool {
     let message = match error {
         QuackError::Protocol(message) | QuackError::Server(message) => message,
+        // A v1-only server can fail to read a v3 CONNECT and answer 500.
+        QuackError::HttpStatus { status: 500, .. } => return true,
         _ => return false,
     };
     let message = message.to_ascii_lowercase();
     message.contains("quack version")
         || message.contains("protocol version")
-        || message.contains("http request failed with 500")
         || message.contains("deserialize")
         || message.contains("end of object")
         || message.contains("unexpected field")
@@ -1116,7 +1114,7 @@ fn http_client(
     if let Some(pin) = pin {
         http = http.use_preconfigured_tls(pinned_client_config(pin)?);
     }
-    Ok(http.build()?)
+    http.build().map_err(QuackError::transport)
 }
 
 pub(crate) fn parse_quack_uri(input: &str, ssl_override: Option<bool>) -> Result<ParsedQuackUri> {
@@ -1441,7 +1439,7 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn structured_proxy_failure_is_decoded_by_transport() {
+    async fn non_success_reply_keeps_its_status_and_raw_body() {
         use std::io::{Read, Write};
         let (listener, uri) = listening_socket();
         listener.set_nonblocking(false).unwrap();
@@ -1453,8 +1451,7 @@ mod tests {
             let mut request = [0; 4096];
             let count = socket.read(&mut request).unwrap();
             assert!(
-                String::from_utf8_lossy(&request[..count])
-                    .contains("x-quaxy-assignment-id: example")
+                String::from_utf8_lossy(&request[..count]).contains("x-example-header: example")
             );
             let body = r#"{"error":{"code":"at_capacity","message":"private details"}}"#;
             write!(socket, "HTTP/1.1 429 Too Many Requests\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{}", body.len(), body).unwrap();
@@ -1462,7 +1459,7 @@ mod tests {
         let transport = Transport {
             base_url: uri,
             http: reqwest::Client::new(),
-            headers: header_map(&[("x-quaxy-assignment-id".into(), "example".into())]).unwrap(),
+            headers: header_map(&[("x-example-header".into(), "example".into())]).unwrap(),
             timeout: Duration::from_secs(3),
         };
         let result = transport
@@ -1477,10 +1474,16 @@ mod tests {
                 QUACK_V3,
             )
             .await;
-        assert!(matches!(
-            result,
-            Err(QuackError::Proxy(crate::ProxyError::AtCapacity))
-        ));
+        let error = result.unwrap_err();
+        assert_eq!(
+            error.http_status(),
+            Some((
+                429,
+                br#"{"error":{"code":"at_capacity","message":"private details"}}"#.as_slice()
+            ))
+        );
+        assert!(error.is_connection_fatal());
+        assert!(!error.to_string().contains("private"));
         server.join().unwrap();
     }
 }

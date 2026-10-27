@@ -252,7 +252,7 @@ heartbeats. The v3 send-data write path is not implemented yet, so `append` and
 `append_rows` return an explicit unsupported-protocol error on a v3 connection;
 they continue to work on v1 connections.
 
-## Admission-aware proxies
+## Raw messages and errors
 
 `inspection::inspect_message_header` reads only a bounded Quack header and
 distinguishes incomplete, invalid, and oversized input. It returns an
@@ -262,11 +262,53 @@ Callers must cap collection at `MAX_MESSAGE_HEADER_BYTES` and replay the inspect
 bytes.
 `inspect_control_response` accepts only bounded complete connect, success, and
 error responses, including DuckDB's structured invalidation flag. Fatality is a
-conservative retirement signal and never authorizes replay.
+conservative retirement signal and never authorizes replay. A connect response
+also carries the heartbeat timeout DuckDB agreed to (`None` on protocol v1): how
+long the session may stay silent before it expires.
 
-The client decodes recognized structured proxy HTTP failures as
-`QuackError::Proxy(ProxyError)`. This is a new error variant: exhaustive error
-matches must handle it. Unknown or oversized failures remain generic protocol
-errors; raw proxy messages are discarded. Supply assignment and lifecycle headers
-through `QuackClientOptions::headers`; the transport sends them on every request,
+For code that holds a connection ID but no `QuackClient`,
+`inspection::encode_cancel` and `inspection::encode_disconnect` build a CANCEL
+for whatever runs on that connection and a DISCONNECT. Neither carries
+credentials. CANCEL exists only in protocol v3; v1 servers answer it with an
+error. DISCONNECT works on both.
+
+HTTP failures with no reply surface as `QuackError::Transport { kind, .. }`,
+where `kind` is `Connect`, `Timeout`, or `Other`. Supply extra headers through
+`QuackClientOptions::headers`; the transport sends them on every request,
 including heartbeat and disconnect. Debug output redacts these headers.
+
+### HTTP error replies
+
+Every non-success HTTP reply surfaces as
+`QuackError::HttpStatus { status, body }` (also `QuackError::http_status()`),
+whoever sent it:
+
+- The Quack server itself answers with a bare status and an empty body when it
+  cannot handle a request, for example a v1 server sent a v3 CONNECT. Errors
+  the server reports, such as SQL errors, come in a normal reply instead and
+  surface as `QuackError::Server`.
+- Something in front of the server, such as a proxy that admits or routes
+  sessions, may reject a request with its own error in the body.
+
+The crate does not interpret the body. It is raw and untrusted, empty when it
+was larger than 16 KiB, and never printed by `Display`. Callers that know a
+proxy's format decode it themselves, and treat anything they do not recognize,
+including the Quack server's bare statuses, as an unknown failure:
+
+```rust,ignore
+use quack_protocol::QuackError;
+
+// `decode_proxy_error` is the caller's own decoder for its proxy's format.
+fn describe(error: &QuackError) -> String {
+    match error.http_status() {
+        Some((status, body)) => match decode_proxy_error(status, body) {
+            Some(code) => format!("proxy rejected the request: {code}"),
+            None => format!("HTTP request failed with status {status}"),
+        },
+        None => error.to_string(),
+    }
+}
+```
+
+Every `HttpStatus` error retires a pooled session, because the crate cannot tell
+a harmless rejection from a lost session.
