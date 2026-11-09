@@ -278,10 +278,10 @@ fn negotiation_retries_v1_for_legacy_handshake_failures_but_not_authentication()
         body: Vec::new(),
     }));
     assert!(is_version_negotiation_error(&QuackError::Server(
-        "Unsupported Quack version - server only supports version 1 of quack".to_string(),
+        "Unsupported Quack version - server only supports version 1 of quack".into(),
     )));
     assert!(!is_version_negotiation_error(&QuackError::Server(
-        "Authentication failed".to_string(),
+        "Authentication failed".into(),
     )));
 }
 
@@ -710,7 +710,12 @@ fn decodes_error_response_with_exception_type_and_extra_info() {
             object.write_field(2, |object| object.write_string("Catalog"))?;
             object.write_field(3, |object| {
                 object.write_list(
-                    &[("name", "t"), ("type", "Table")],
+                    &[
+                        ("name", "t"),
+                        ("type", "Table"),
+                        ("error_subtype", "MISSING_ENTRY"),
+                        ("future_key", "future_value"),
+                    ],
                     |entry, (key, value), _| {
                         entry.write_object(|entry| {
                             entry.write_field(0, |entry| entry.write_string(key))?;
@@ -723,11 +728,24 @@ fn decodes_error_response_with_exception_type_and_extra_info() {
         })
         .unwrap();
 
-    match decode_message_for_version(&writer.into_bytes(), QUACK_V3).unwrap() {
-        QuackMessage::ErrorResponse { message, .. } => {
-            assert_eq!(message, "Catalog Error: Table with name t does not exist!")
-        }
-        other => panic!("expected ERROR_RESPONSE, got {other:?}"),
+    let bytes = writer.into_bytes();
+    for version in [QUACK_V1, QUACK_V3] {
+        let QuackMessage::ErrorResponse { error, .. } =
+            decode_message_for_version(&bytes, version).unwrap()
+        else {
+            panic!("expected error");
+        };
+        assert_eq!(
+            error.message(),
+            "Catalog Error: Table with name t does not exist!"
+        );
+        assert_eq!(error.exception_type(), Some("Catalog"));
+        assert_eq!(error.error_subtype(), Some("MISSING_ENTRY"));
+        assert_eq!(
+            error.extra_info().get("future_key").map(String::as_str),
+            Some("future_value")
+        );
+        assert!(error.must_invalidate());
     }
 }
 
@@ -755,8 +773,11 @@ fn decodes_error_response_with_only_a_message() {
             .unwrap();
 
         match decode_message_for_version(&writer.into_bytes(), version).unwrap() {
-            QuackMessage::ErrorResponse { message, .. } => {
-                assert_eq!(message, "Catalog Error: Table with name t does not exist!")
+            QuackMessage::ErrorResponse { error, .. } => {
+                assert_eq!(
+                    error.message(),
+                    "Catalog Error: Table with name t does not exist!"
+                )
             }
             other => panic!("expected ERROR_RESPONSE, got {other:?}"),
         }

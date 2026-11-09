@@ -688,6 +688,35 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn structured_server_errors_reach_callers_and_control_session_reuse() {
+        for invalidated in [false, true] {
+            let expected = crate::ServerError::new("unprefixed failure")
+                .with_exception_type("FutureType")
+                .with_extra_info("error_subtype", "FUTURE_SUBTYPE")
+                .with_extra_info("future_key", "invented-value")
+                .with_invalidation(invalidated);
+            let (uri, server) = scripted_server(vec![
+                connection_response("structured-session"),
+                QuackMessage::ErrorResponse {
+                    header: MessageHeader::new(MessageType::ErrorResponse),
+                    error: expected.clone(),
+                },
+                success_response(), // DISCONNECT, never a replay of the query
+            ]);
+            let client = QuackClient::connect(&uri, v1_options()).await.unwrap();
+            let Err(QuackError::Server(error)) =
+                client.query("INSERT INTO items VALUES (1)", None).await
+            else {
+                panic!("expected structured error");
+            };
+            assert_eq!(error, expected);
+            assert_eq!(client.is_reusable(), !invalidated);
+            client.disconnect().await.unwrap();
+            server.join().unwrap();
+        }
+    }
+
+    #[tokio::test]
     async fn ambiguous_connection_error_text_is_returned_without_replay() {
         let connection_response = QuackMessage::ConnectionResponse {
             header: MessageHeader::new(MessageType::ConnectionResponse)
@@ -699,7 +728,7 @@ mod tests {
         };
         let ambiguous_error = QuackMessage::ErrorResponse {
             header: MessageHeader::new(MessageType::ErrorResponse),
-            message: "Invalid connection id".to_string(),
+            error: "Invalid connection id".into(),
         };
         let disconnect_response = QuackMessage::SuccessResponse {
             header: MessageHeader::new(MessageType::SuccessResponse),
@@ -718,7 +747,7 @@ mod tests {
             Err(error) => error,
         };
         assert!(
-            matches!(error, QuackError::Server(ref message) if message == "Invalid connection id"),
+            matches!(error, QuackError::Server(ref error) if error.message() == "Invalid connection id"),
             "the original server error must be returned: {error}"
         );
 
