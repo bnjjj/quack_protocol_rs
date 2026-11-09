@@ -853,7 +853,7 @@ pub(crate) fn read_error_fields(object: &mut BinaryReader<'_>) -> Result<crate::
 /// Encodes metadata only when present, retaining legacy message-only responses.
 fn write_error_fields(object: &mut BinaryWriter, error: &crate::ServerError) -> Result<()> {
     write_optional_string(object, 1, Some(error.message()))?;
-    write_optional_string(object, 2, error.exception_type())?;
+    write_optional_string(object, 2, error.exception_type_raw())?;
     if !error.extra_info().is_empty() {
         object.write_field(3, |object| {
             object.write_uleb(error.extra_info().len() as u64)?;

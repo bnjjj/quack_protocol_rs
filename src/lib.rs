@@ -28,7 +28,9 @@ pub use builders::{ColumnDefinition, ColumnInput, column, data_chunk, data_chunk
 pub use client::{
     QuackClient, QuackClientOptions, QuackConnectionInfo, QuackResultStream, QueryMetadata,
 };
-pub use errors::{QuackError, Result, ServerError, TransportErrorKind};
+pub use errors::{
+    ErrorSubtype, ExceptionType, QuackError, Result, ServerError, TransportErrorKind,
+};
 pub use futures_core::Stream;
 pub use json::{
     BigIntJsonMode, BytesJsonMode, JsonOptions, TaggedJsonMode, to_json_row, to_json_rows,

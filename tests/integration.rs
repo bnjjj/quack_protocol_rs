@@ -738,8 +738,14 @@ async fn live_quack_surfaces_server_errors() -> Result<()> {
             .contains("definitely_missing_quack_rust_table")
     );
     if client.info.as_ref().and_then(|info| info.quack_version) == Some(3) {
-        assert_eq!(error.exception_type(), Some("Catalog"));
-        assert_eq!(error.error_subtype(), Some("MISSING_ENTRY"));
+        assert_eq!(
+            error.exception_type(),
+            Some(quack_protocol::ExceptionType::Catalog)
+        );
+        assert_eq!(
+            error.error_subtype(),
+            Some(quack_protocol::ErrorSubtype::MissingEntry)
+        );
     }
     assert!(!error.is_fatal());
     client.execute("SELECT 1", None).await?;

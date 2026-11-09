@@ -268,10 +268,18 @@ long the session may stay silent before it expires.
 
 `QuackError::Server` contains a `ServerError` instead of a string as of 0.6.
 Use `message()`, `exception_type()`, `extra_info()`, `error_subtype()`, and
-`must_invalidate()` to inspect it. Unknown types and metadata keys are retained;
-legacy message-only errors have no type or extra information. DuckDB supplies
-subtypes only for some errors. The SDK reads the native protocol fields without
-requiring `errors_as_json`.
+`must_invalidate()` to inspect it. The type and subtype accessors return borrowed
+`ExceptionType` and `ErrorSubtype` enums. Match known variants directly and handle
+the fallback: both enums are non-exhaustive and retain unrecognized values in
+`Unknown(&str)`. Legacy message-only errors return `None`, distinct from an
+unrecognized value. DuckDB supplies subtypes only for some errors; interpret them
+together with the exception type.
+
+`exception_type_raw()` and `error_subtype_raw()` return the original strings.
+The enums are views over that data, so decoding and re-encoding preserve aliases,
+unknown metadata, and extra-info keys exactly. `as_str()` on an enum returns its
+canonical wire name, or the original unknown string. Unknown text remains
+sensitive. The SDK reads native protocol fields without requiring `errors_as_json`.
 
 `ServerError::is_fatal()` combines explicit invalidation, Internal/Fatal types,
 and conservative legacy retirement signals. Both the client and
@@ -283,7 +291,8 @@ responses rather than exposing partial metadata.
 
 Server metadata is untrusted and may contain credentials, SQL, identifiers, or
 paths. `ServerError` and its containing error response redact these values in
-`Debug`; `Display` continues to include the raw message for compatibility.
+`Debug`; the enum views also redact their unknown payloads. `Display` continues
+to include the raw message for compatibility.
 Consumers must sanitize messages and metadata before logging or forwarding them.
 
 For code that holds a connection ID but no `QuackClient`,

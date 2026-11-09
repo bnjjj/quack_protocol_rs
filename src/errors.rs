@@ -1,6 +1,8 @@
 //! Client transport, protocol, and structured server errors.
 
+mod classification;
 mod server;
+pub use classification::{ErrorSubtype, ExceptionType};
 pub use server::ServerError;
 
 pub type Result<T> = std::result::Result<T, QuackError>;

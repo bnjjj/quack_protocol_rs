@@ -2,6 +2,8 @@
 
 use std::{collections::BTreeMap, fmt};
 
+use super::{ErrorSubtype, ExceptionType};
+
 /// A server error, including metadata supplied by newer protocol implementations.
 ///
 /// The client and inspector preserve unknown exception types and extra-info keys.
@@ -53,8 +55,17 @@ impl ServerError {
         &self.message
     }
 
-    /// Returns the structured type, or `None` for a missing or empty wire field.
-    pub fn exception_type(&self) -> Option<&str> {
+    /// Returns a typed view, or `None` for a missing or empty wire field.
+    ///
+    /// Unknown values borrow the original text without changing stored metadata.
+    pub fn exception_type(&self) -> Option<ExceptionType<'_>> {
+        self.exception_type_raw().map(ExceptionType::from)
+    }
+
+    /// Returns the exact type text, including recognized aliases and unknown names.
+    ///
+    /// Codecs use this to preserve wire data. The text may be sensitive.
+    pub fn exception_type_raw(&self) -> Option<&str> {
         self.exception_type.as_deref()
     }
 
@@ -63,8 +74,17 @@ impl ServerError {
         &self.extra_info
     }
 
-    /// Returns the optional DuckDB subtype; it is not a universal error code.
-    pub fn error_subtype(&self) -> Option<&str> {
+    /// Returns the optional typed subtype; it is not a universal error code.
+    ///
+    /// Classification does not move or duplicate the extra-info entry.
+    pub fn error_subtype(&self) -> Option<ErrorSubtype<'_>> {
+        self.error_subtype_raw().map(ErrorSubtype::from)
+    }
+
+    /// Returns the original subtype text without interpreting or sanitizing it.
+    ///
+    /// Missing metadata is `None`; present unrecognized values remain available.
+    pub fn error_subtype_raw(&self) -> Option<&str> {
         self.extra_info.get("error_subtype").map(String::as_str)
     }
 
@@ -82,7 +102,7 @@ impl ServerError {
         self.must_invalidate
             || matches!(
                 self.exception_type(),
-                Some("FATAL" | "Fatal" | "INTERNAL" | "Internal")
+                Some(ExceptionType::Fatal | ExceptionType::Internal)
             )
             || [
                 "FATAL Error:",
@@ -128,6 +148,63 @@ impl std::error::Error for ServerError {}
 mod tests {
     use super::*;
 
+    /// Typed views distinguish missing, recognized, and unknown metadata.
+    #[test]
+    fn typed_views_preserve_absence_aliases_and_unknown_values() {
+        let missing = ServerError::new("legacy").with_exception_type("");
+        assert_eq!(missing.exception_type(), None);
+        assert_eq!(missing.error_subtype(), None);
+
+        for (raw, kind) in [
+            ("TransactionContext", ExceptionType::Transaction),
+            ("TRANSACTION", ExceptionType::Transaction),
+            ("Invalid type", ExceptionType::InvalidType),
+            ("NOT IMPLEMENTED", ExceptionType::NotImplemented),
+            ("CATALOG", ExceptionType::Catalog),
+            ("Data Corruption", ExceptionType::DataCorruption),
+            ("Resource In Use", ExceptionType::ResourceInUse),
+            ("Unknown Type", ExceptionType::UnknownType),
+            ("Unknown", ExceptionType::Unknown("Unknown")),
+            ("Network", ExceptionType::Unknown("Network")),
+            ("internal", ExceptionType::Unknown("internal")),
+        ] {
+            let error = ServerError::new("detail").with_exception_type(raw);
+            assert_eq!(error.exception_type(), Some(kind));
+            assert_eq!(error.exception_type_raw(), Some(raw));
+        }
+        for (raw, subtype) in [
+            ("MISSING_ENTRY", ErrorSubtype::MissingEntry),
+            ("ENTRY_ALREADY_EXISTS", ErrorSubtype::EntryAlreadyExists),
+            ("COLUMN_NOT_FOUND", ErrorSubtype::ColumnNotFound),
+            ("NO_MATCHING_FUNCTION", ErrorSubtype::NoMatchingFunction),
+            ("UNSUPPORTED", ErrorSubtype::Unsupported),
+            ("SYNTAX_ERROR", ErrorSubtype::SyntaxError),
+            ("", ErrorSubtype::Unknown("")),
+            ("missing_entry", ErrorSubtype::Unknown("missing_entry")),
+        ] {
+            let error = ServerError::new("detail").with_extra_info("error_subtype", raw);
+            assert_eq!(error.error_subtype(), Some(subtype));
+            assert_eq!(error.error_subtype_raw(), Some(raw));
+            assert_eq!(error.extra_info().len(), 1);
+            assert_eq!(subtype.as_str(), raw);
+        }
+    }
+
+    /// Formatting a borrowed classification never discloses future metadata.
+    #[test]
+    fn typed_views_redact_unknown_values_without_losing_them() {
+        let error = ServerError::new("detail")
+            .with_exception_type("invented-sensitive-type")
+            .with_extra_info("error_subtype", "invented-sensitive-subtype");
+        let kind = error.exception_type().unwrap();
+        let subtype = error.error_subtype().unwrap();
+        assert_eq!(kind.as_str(), error.exception_type_raw().unwrap());
+        assert_eq!(subtype.as_str(), error.error_subtype_raw().unwrap());
+        assert!(!format!("{kind:?} {subtype:?} {error:?}").contains("invented"));
+        assert_eq!(format!("{:?}", ExceptionType::Catalog), "Catalog");
+        assert_eq!(format!("{:?}", ErrorSubtype::MissingEntry), "MissingEntry");
+    }
+
     #[test]
     fn recovery_uses_metadata_and_retains_conservative_legacy_signals() {
         for error in [
@@ -156,7 +233,10 @@ mod tests {
         let error = ServerError::new("invented-sensitive-message")
             .with_exception_type("invented-sensitive-type")
             .with_extra_info("invented-sensitive-key", "invented-sensitive-value");
-        assert_eq!(error.exception_type(), Some("invented-sensitive-type"));
+        assert_eq!(
+            error.exception_type(),
+            Some(ExceptionType::Unknown("invented-sensitive-type"))
+        );
         assert_eq!(
             error.extra_info()["invented-sensitive-key"],
             "invented-sensitive-value"

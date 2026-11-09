@@ -195,7 +195,7 @@ pub fn encode_error_response(
     }
     // Reject oversized inputs before cloning them into the wire representation.
     let mut strings = std::iter::once(error.message())
-        .chain(error.exception_type())
+        .chain(error.exception_type_raw())
         .chain(
             error
                 .extra_info()

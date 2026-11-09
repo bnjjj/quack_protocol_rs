@@ -739,13 +739,59 @@ fn decodes_error_response_with_exception_type_and_extra_info() {
             error.message(),
             "Catalog Error: Table with name t does not exist!"
         );
-        assert_eq!(error.exception_type(), Some("Catalog"));
-        assert_eq!(error.error_subtype(), Some("MISSING_ENTRY"));
+        assert_eq!(error.exception_type(), Some(crate::ExceptionType::Catalog));
+        assert_eq!(
+            error.error_subtype(),
+            Some(crate::ErrorSubtype::MissingEntry)
+        );
         assert_eq!(
             error.extra_info().get("future_key").map(String::as_str),
             Some("future_value")
         );
         assert!(error.must_invalidate());
+    }
+}
+
+/// Typed inspection never normalizes aliases or drops new metadata on the wire.
+#[test]
+fn typed_error_views_round_trip_original_metadata() {
+    for version in [QUACK_V1, QUACK_V3] {
+        for (raw_type, raw_subtype) in [
+            ("Internal", "invented-sensitive-subtype"),
+            ("CATALOG", "MISSING_ENTRY"),
+            ("invented-sensitive-type", "invented-sensitive-subtype"),
+        ] {
+            let original = ServerError::new("invented-sensitive-message")
+                .with_exception_type(raw_type)
+                .with_extra_info("error_subtype", raw_subtype)
+                .with_extra_info("future_key", "invented-sensitive-value");
+            let message = QuackMessage::ErrorResponse {
+                header: MessageHeader {
+                    message_type: MessageType::ErrorResponse,
+                    connection_id: some_name("connection-example"),
+                    client_query_id: Some(42),
+                },
+                error: original.clone(),
+            };
+            let bytes = encode_message_for_version(&message, version).unwrap();
+            let decoded = decode_message_for_version(&bytes, version).unwrap();
+            let QuackMessage::ErrorResponse { error, .. } = &decoded else {
+                panic!("expected server error");
+            };
+            assert_eq!(error.exception_type(), Some(ExceptionType::from(raw_type)));
+            assert_eq!(error.error_subtype(), Some(ErrorSubtype::from(raw_subtype)));
+            assert_eq!(error.exception_type_raw(), Some(raw_type));
+            assert_eq!(error.error_subtype_raw(), Some(raw_subtype));
+            assert_eq!(error, &original);
+            assert!(
+                !format!("{:?} {:?}", error.exception_type(), error.error_subtype())
+                    .contains("invented")
+            );
+            assert_eq!(
+                encode_message_for_version(&decoded, version).unwrap(),
+                bytes
+            );
+        }
     }
 }
 
