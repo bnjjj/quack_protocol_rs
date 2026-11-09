@@ -919,8 +919,8 @@ impl Transport {
         }
         let bytes = response.bytes().await.map_err(QuackError::transport)?;
         let decoded = decode_message_for_version(&bytes, quack_version)?;
-        if let QuackMessage::ErrorResponse { message, .. } = decoded {
-            return Err(QuackError::server(message));
+        if let QuackMessage::ErrorResponse { error, .. } = decoded {
+            return Err(QuackError::Server(error));
         }
         Ok(decoded)
     }
@@ -1085,7 +1085,8 @@ fn validate_heartbeat_timeout(seconds: u64) -> Result<()> {
 
 pub(crate) fn is_version_negotiation_error(error: &QuackError) -> bool {
     let message = match error {
-        QuackError::Protocol(message) | QuackError::Server(message) => message,
+        QuackError::Protocol(message) => message.as_str(),
+        QuackError::Server(error) => error.message(),
         // A v1-only server can fail to read a v3 CONNECT and answer 500.
         QuackError::HttpStatus { status: 500, .. } => return true,
         _ => return false,
@@ -1604,10 +1605,12 @@ mod tests {
             return;
         };
         // Protocol v1 has no CANCEL, so the server refuses it.
-        assert_eq!(
-            post_raw(&raw, encode_cancel(&connection_id).unwrap()).await,
-            ControlResponse::Error { fatal: false }
-        );
+        let ControlResponse::Error { error } =
+            post_raw(&raw, encode_cancel(&connection_id).unwrap()).await
+        else {
+            panic!("expected error");
+        };
+        assert!(!error.is_fatal());
         assert_disconnect_closes(&raw, &client, &connection_id).await;
     }
 }

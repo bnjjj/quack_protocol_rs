@@ -2,7 +2,8 @@
 //!
 //! Headers share the client's codec. Incomplete input is distinct from invalid
 //! input; callers must stop collecting at [`MAX_MESSAGE_HEADER_BYTES`]. Neither this
-//! API nor its errors expose SQL, authentication fields, or upstream error text.
+//! header API nor its errors expose SQL or authentication fields. Structured
+//! error inspection returns untrusted data that callers must sanitize.
 //!
 //! Code that holds a connection ID but no client can also build the control
 //! messages that stop and close it: [`encode_cancel`] and [`encode_disconnect`].
@@ -11,7 +12,7 @@ use std::time::Duration;
 
 pub use crate::messages::MessageType as Operation;
 use crate::{
-    QuackError,
+    ServerError,
     binary::{BinaryReader, HugeIntParts},
     constants::{MAX_HEARTBEAT_TIMEOUT_SECS, QUACK_V3},
     messages::{self, MessageHeader as WireHeader, QuackMessage},
@@ -121,7 +122,7 @@ pub enum ControlResponse {
     },
     Success,
     Error {
-        fatal: bool,
+        error: ServerError,
     },
 }
 
@@ -138,19 +139,11 @@ pub fn inspect_control_response(bytes: &[u8]) -> Result<ControlResponse, Inspect
     }
     if header.operation == Operation::ErrorResponse {
         let mut reader = BinaryReader::new(&bytes[header.encoded_len..]);
-        let (message, invalidated) = reader
+        let error = reader
             .read_object(messages::read_error_fields)
             .map_err(|_| InspectionError::Invalid)?;
         reader.assert_eof().map_err(|_| InspectionError::Invalid)?;
-        // Legacy versions carry only text. This conservative fallback can cause
-        // recycling, but must never authorize replay or release ownership.
-        let fatal = invalidated
-            || message.starts_with("FATAL Error:")
-            || message.starts_with("INTERNAL Error:")
-            || message.starts_with("Fatal Error:")
-            || message.starts_with("Internal Error:")
-            || QuackError::server(message).is_connection_fatal();
-        return Ok(ControlResponse::Error { fatal });
+        return Ok(ControlResponse::Error { error });
     }
     // These bodies are compatible across v1 and v3; v3's added fields are optional.
     let message = messages::decode_message_for_version(bytes, crate::constants::QUACK_V3)
@@ -181,6 +174,52 @@ pub fn inspect_control_response(bytes: &[u8]) -> Result<ControlResponse, Inspect
     }
 }
 
+/// Encodes a bounded error response using the protocol's shared codec.
+///
+/// Proxies can replace an upstream error with sanitized metadata while retaining
+/// its correlation header. This does not sanitize the supplied error itself.
+/// The error body uses the optional fields understood by both supported codecs.
+pub fn encode_error_response(
+    header: &MessageHeader,
+    error: &ServerError,
+) -> Result<Vec<u8>, InspectionError> {
+    if header.operation != Operation::ErrorResponse {
+        return Err(InspectionError::Invalid);
+    }
+    if header
+        .connection_id
+        .as_ref()
+        .is_some_and(|id| id.len() > MAX_CONNECTION_ID_BYTES)
+    {
+        return Err(InspectionError::TooLarge);
+    }
+    // Reject oversized inputs before cloning them into the wire representation.
+    let mut strings = std::iter::once(error.message())
+        .chain(error.exception_type_raw())
+        .chain(
+            error
+                .extra_info()
+                .iter()
+                .flat_map(|(key, value)| [key.as_str(), value.as_str()]),
+        );
+    let total = strings.try_fold(0_usize, |total, value| total.checked_add(value.len()));
+    if total.is_none_or(|total| total > MAX_CONTROL_RESPONSE_BYTES) {
+        return Err(InspectionError::TooLarge);
+    }
+    let bytes = encode_v3(QuackMessage::ErrorResponse {
+        header: WireHeader {
+            message_type: Operation::ErrorResponse,
+            connection_id: header.connection_id.clone(),
+            client_query_id: header.client_query_id,
+        },
+        error: error.clone(),
+    })?;
+    if bytes.len() > MAX_CONTROL_RESPONSE_BYTES {
+        return Err(InspectionError::TooLarge);
+    }
+    Ok(bytes)
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -195,6 +234,68 @@ mod tests {
             connection_id: connection.map(str::to_owned),
             client_query_id: Some(42),
         }
+    }
+
+    #[test]
+    fn structured_errors_round_trip_and_truncation_is_rejected() {
+        let error = ServerError::new("invented-sensitive-message")
+            .with_exception_type("FutureType")
+            .with_extra_info("error_subtype", "FUTURE_SUBTYPE")
+            .with_extra_info("future_key", "invented-sensitive-value")
+            .with_invalidation(true);
+        let wire_header = MessageHeader {
+            operation: Operation::ErrorResponse,
+            connection_id: Some("example".into()),
+            client_query_id: Some(42),
+            encoded_len: 0,
+        };
+        let bytes = encode_error_response(&wire_header, &error).unwrap();
+        assert_eq!(
+            inspect_control_response(&bytes).unwrap(),
+            ControlResponse::Error {
+                error: error.clone()
+            }
+        );
+        for version in [crate::constants::QUACK_V1, QUACK_V3] {
+            let QuackMessage::ErrorResponse { error: decoded, .. } =
+                messages::decode_message_for_version(&bytes, version).unwrap()
+            else {
+                panic!("expected error");
+            };
+            assert_eq!(decoded, error);
+        }
+        for end in 0..bytes.len() {
+            assert!(inspect_control_response(&bytes[..end]).is_err());
+        }
+        let mut trailing = bytes.clone();
+        trailing.push(0);
+        assert!(inspect_control_response(&trailing).is_err());
+        assert_eq!(
+            encode_error_response(
+                &wire_header,
+                &ServerError::new("x".repeat(MAX_CONTROL_RESPONSE_BYTES))
+            ),
+            Err(InspectionError::TooLarge)
+        );
+    }
+
+    #[test]
+    fn duplicate_metadata_keys_are_rejected() {
+        let mut writer = BinaryWriter::new();
+        encode_header(&mut writer, &header(Operation::ErrorResponse, None)).unwrap();
+        writer
+            .write_object(|w| {
+                w.write_field(3, |w| {
+                    w.write_list(&["first", "second"], |w, value, _| {
+                        w.write_object(|w| {
+                            w.write_field(0, |w| w.write_string("error_subtype"))?;
+                            w.write_field(1, |w| w.write_string(value))
+                        })
+                    })
+                })
+            })
+            .unwrap();
+        assert!(inspect_control_response(writer.as_slice()).is_err());
     }
 
     #[test]
@@ -275,13 +376,13 @@ mod tests {
         ] {
             let bytes = encode_message(&QuackMessage::ErrorResponse {
                 header: header(Operation::ErrorResponse, None),
-                message: message.into(),
+                error: message.into(),
             })
             .unwrap();
-            assert_eq!(
-                inspect_control_response(&bytes).unwrap(),
-                ControlResponse::Error { fatal }
-            );
+            let ControlResponse::Error { error } = inspect_control_response(&bytes).unwrap() else {
+                panic!("expected error");
+            };
+            assert_eq!(error.is_fatal(), fatal);
         }
     }
 
@@ -378,10 +479,13 @@ mod tests {
                 })
                 .unwrap();
             if count == 0 {
-                assert_eq!(
-                    inspect_control_response(writer.as_slice()).unwrap(),
-                    ControlResponse::Error { fatal: true }
-                );
+                let ControlResponse::Error { error } =
+                    inspect_control_response(writer.as_slice()).unwrap()
+                else {
+                    panic!("expected error");
+                };
+                assert!(error.must_invalidate());
+                assert!(error.is_fatal());
             } else {
                 assert!(inspect_control_response(writer.as_slice()).is_err());
             }

@@ -729,7 +729,26 @@ async fn live_quack_surfaces_server_errors() -> Result<()> {
         Err(error) => error,
         Ok(_) => panic!("query should fail"),
     };
-    assert!(matches!(error, QuackError::Server(_)));
+    let QuackError::Server(error) = error else {
+        panic!("expected server error");
+    };
+    assert!(
+        error
+            .message()
+            .contains("definitely_missing_quack_rust_table")
+    );
+    if client.info.as_ref().and_then(|info| info.quack_version) == Some(3) {
+        assert_eq!(
+            error.exception_type(),
+            Some(quack_protocol::ExceptionType::Catalog)
+        );
+        assert_eq!(
+            error.error_subtype(),
+            Some(quack_protocol::ErrorSubtype::MissingEntry)
+        );
+    }
+    assert!(!error.is_fatal());
+    client.execute("SELECT 1", None).await?;
 
     client.disconnect().await?;
     Ok(())

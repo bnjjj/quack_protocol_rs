@@ -2,8 +2,8 @@
 
 Rust client-side SDK for DuckDB's experimental Quack remote protocol.
 
-The `0.3.0` line supports both Quack protocol v1 and protocol v3 from
-DuckDB 2.0 alpha:
+The `0.6.0` line supports both Quack protocol v1 and protocol v3 from
+DuckDB 2.0:
 
 - DuckDB `BinarySerializer`-compatible primitive, object, logical type, vector, and `DataChunk` codecs.
 - Quack connection leases and heartbeats, prepare/query, acknowledged fetch streaming,
@@ -144,10 +144,10 @@ cursor for a connection id nobody can use again:
 ### When the server forgets a connection
 
 After a server restart, a session opened against the old server is gone and the
-server answers `Invalid connection id`. Current Quack protocol versions carry
-only the error text, however, and SQL can raise exactly the same message after
-an earlier statement committed. The client therefore never retries a statement
-automatically.
+server answers `Invalid connection id`. Structured error metadata and legacy
+messages do not prove that a statement did not execute: SQL can raise the same
+message after an earlier statement committed. The client therefore never retries
+a statement automatically.
 
 The pool retires a session when the response exactly matches a known stale
 connection message, but returns the error to the caller. A later pool call opens
@@ -265,6 +265,35 @@ error responses, including DuckDB's structured invalidation flag. Fatality is a
 conservative retirement signal and never authorizes replay. A connect response
 also carries the heartbeat timeout DuckDB agreed to (`None` on protocol v1): how
 long the session may stay silent before it expires.
+
+`QuackError::Server` contains a `ServerError` instead of a string as of 0.6.
+Use `message()`, `exception_type()`, `extra_info()`, `error_subtype()`, and
+`must_invalidate()` to inspect it. The type and subtype accessors return borrowed
+`ExceptionType` and `ErrorSubtype` enums. Match known variants directly and handle
+the fallback: both enums are non-exhaustive and retain unrecognized values in
+`Unknown(&str)`. Legacy message-only errors return `None`, distinct from an
+unrecognized value. DuckDB supplies subtypes only for some errors; interpret them
+together with the exception type.
+
+`exception_type_raw()` and `error_subtype_raw()` return the original strings.
+The enums are views over that data, so decoding and re-encoding preserve aliases,
+unknown metadata, and extra-info keys exactly. `as_str()` on an enum returns its
+canonical wire name, or the original unknown string. Unknown text remains
+sensitive. The SDK reads native protocol fields without requiring `errors_as_json`.
+
+`ServerError::is_fatal()` combines explicit invalidation, Internal/Fatal types,
+and conservative legacy retirement signals. Both the client and
+`ControlResponse::Error { error }` use this classification. It never authorizes
+query replay. Proxies can use `inspection::encode_error_response` to return a
+bounded error with its correlation header after applying their disclosure policy.
+The inspector rejects malformed, duplicate-key, truncated, and oversized control
+responses rather than exposing partial metadata.
+
+Server metadata is untrusted and may contain credentials, SQL, identifiers, or
+paths. `ServerError` and its containing error response redact these values in
+`Debug`; the enum views also redact their unknown payloads. `Display` continues
+to include the raw message for compatibility.
+Consumers must sanitize messages and metadata before logging or forwarding them.
 
 For code that holds a connection ID but no `QuackClient`,
 `inspection::encode_cancel` and `inspection::encode_disconnect` build a CANCEL

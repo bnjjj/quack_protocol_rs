@@ -1,3 +1,10 @@
+//! Client transport, protocol, and structured server errors.
+
+mod classification;
+mod server;
+pub use classification::{ErrorSubtype, ExceptionType};
+pub use server::ServerError;
+
 pub type Result<T> = std::result::Result<T, QuackError>;
 
 // The current protocol has no typed error code. Exact comparison keeps this
@@ -17,7 +24,7 @@ pub enum QuackError {
     #[error("quack protocol error: {0}")]
     Protocol(String),
     #[error("quack server error: {0}")]
-    Server(String),
+    Server(ServerError),
     #[error("unsupported quack type: {0}")]
     UnsupportedType(String),
     /// The HTTP request got a non-success reply. It may come from the Quack
@@ -69,10 +76,6 @@ impl QuackError {
         Self::Protocol(message.into())
     }
 
-    pub(crate) fn server(message: impl Into<String>) -> Self {
-        Self::Server(message.into())
-    }
-
     pub(crate) fn unsupported(message: impl Into<String>) -> Self {
         Self::UnsupportedType(message.into())
     }
@@ -110,16 +113,12 @@ impl QuackError {
     /// it out again and again. Errors raised without touching the wire - bad
     /// arguments, unsupported types - are not counted.
     ///
-    /// This says nothing about whether the request ran. Current protocol
-    /// versions carry only an error message string, and SQL can produce the
-    /// same text as a missing-connection response, so no error is safe to
-    /// retry automatically.
+    /// This says nothing about whether the request ran. Structured metadata
+    /// and legacy text never authorize automatic replay.
     pub(crate) fn is_connection_fatal(&self) -> bool {
         match self {
             Self::HttpStatus { .. } | Self::Transport { .. } | Self::Protocol(_) => true,
-            Self::Server(message) => RETIRE_CONNECTION_MESSAGES
-                .iter()
-                .any(|known| message == known),
+            Self::Server(error) => error.is_fatal(),
             Self::UnsupportedType(_) | Self::Url(_) | Self::Utf8(_) => false,
         }
     }
@@ -132,7 +131,7 @@ mod tests {
     #[test]
     fn exact_connection_error_text_retires() {
         for message in RETIRE_CONNECTION_MESSAGES {
-            let err = QuackError::server(message);
+            let err = QuackError::Server(message.into());
             assert!(err.is_connection_fatal(), "{message}");
         }
     }
@@ -144,14 +143,14 @@ mod tests {
             "statement failed: Invalid connection id after committing",
             "Connection does not exist / already disconnected (from SQL)",
         ] {
-            let err = QuackError::server(message);
+            let err = QuackError::Server(message.into());
             assert!(!err.is_connection_fatal(), "{message}");
         }
     }
 
     #[test]
     fn sql_errors_leave_the_connection_usable() {
-        let err = QuackError::server("Table with name t does not exist!");
+        let err = QuackError::Server("Table with name t does not exist!".into());
         assert!(!err.is_connection_fatal());
     }
 

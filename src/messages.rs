@@ -150,7 +150,7 @@ pub(crate) enum QuackMessage {
     },
     ErrorResponse {
         header: MessageHeader,
-        message: String,
+        error: crate::ServerError,
     },
 }
 
@@ -359,10 +359,9 @@ fn encode_body_v1(writer: &mut BinaryWriter, message: &QuackMessage) -> Result<(
         QuackMessage::Cancel { .. } => Err(QuackError::protocol(
             "CANCEL_REQUEST is not supported by Quack protocol v1",
         )),
-        QuackMessage::ErrorResponse { message, .. } => writer.write_object(|object| {
-            write_optional_string(object, 1, Some(message))?;
-            Ok(())
-        }),
+        QuackMessage::ErrorResponse { error, .. } => {
+            writer.write_object(|object| write_error_fields(object, error))
+        }
     }
 }
 
@@ -493,10 +492,9 @@ fn encode_body_v3(writer: &mut BinaryWriter, message: &QuackMessage) -> Result<(
         QuackMessage::Cancel { query_uuid, .. } => writer.write_object(|object| {
             object.write_field(1, |object| object.write_huge_int_parts(*query_uuid))
         }),
-        QuackMessage::ErrorResponse { message, .. } => writer.write_object(|object| {
-            write_optional_string(object, 1, Some(message))?;
-            Ok(())
-        }),
+        QuackMessage::ErrorResponse { error, .. } => {
+            writer.write_object(|object| write_error_fields(object, error))
+        }
     }
 }
 
@@ -612,7 +610,7 @@ fn decode_body_v1(reader: &mut BinaryReader<'_>, header: MessageHeader) -> Resul
         MessageType::ErrorResponse => reader.read_object(|object| {
             Ok(QuackMessage::ErrorResponse {
                 header,
-                message: read_error_message(object)?,
+                error: read_error_fields(object)?,
             })
         }),
         other => Err(QuackError::protocol(format!(
@@ -749,7 +747,7 @@ fn decode_body_v3(reader: &mut BinaryReader<'_>, header: MessageHeader) -> Resul
         MessageType::ErrorResponse => reader.read_object(|object| {
             Ok(QuackMessage::ErrorResponse {
                 header,
-                message: read_error_message(object)?,
+                error: read_error_fields(object)?,
             })
         }),
         other => Err(QuackError::protocol(format!(
@@ -824,38 +822,52 @@ fn read_optional_string(reader: &mut BinaryReader<'_>, field_id: u16) -> Result<
     )
 }
 
-/// Reads an ERROR_RESPONSE body. Servers since DuckDB 2.0 follow the message with
-/// the exception type (2), extra info (3) and a must-invalidate flag (4); the
-/// client reports only the message, so the rest is read past.
-fn read_error_message(object: &mut BinaryReader<'_>) -> Result<String> {
-    read_error_fields(object).map(|(message, _)| message)
-}
-
-// Share error decoding with bounded inspection. Do not preallocate using
-// the untrusted extra-info count: malformed input must fail before allocation.
-pub(crate) fn read_error_fields(object: &mut BinaryReader<'_>) -> Result<(String, bool)> {
+/// Decodes the common legacy/structured error body without allocating from peer counts.
+pub(crate) fn read_error_fields(object: &mut BinaryReader<'_>) -> Result<crate::ServerError> {
     let message = object.read_optional_field(1, |object| object.read_string(), String::new())?;
     let exception = object.read_optional_field(2, |object| object.read_string(), String::new())?;
+    let mut error = crate::ServerError::new(message).with_exception_type(exception);
     object.read_optional_field(
         3,
         |object| {
             let length = object.read_uleb_usize()?;
             for _ in 0..length {
-                object.read_object(|entry| {
-                    entry.read_required_field(0, |entry| entry.read_string())?;
-                    entry.read_required_field(1, |entry| entry.read_string())?;
-                    Ok(())
+                let (key, value) = object.read_object(|entry| {
+                    Ok((
+                        entry.read_required_field(0, |entry| entry.read_string())?,
+                        entry.read_required_field(1, |entry| entry.read_string())?,
+                    ))
                 })?;
+                if error.extra_info.insert(key, value).is_some() {
+                    return Err(QuackError::protocol("duplicate server error metadata key"));
+                }
             }
             Ok(())
         },
         (),
     )?;
-    let invalidated = object.read_optional_field(4, |object| object.read_bool(), false)?;
-    let fatal = invalidated
-        || matches!(
-            exception.as_str(),
-            "FATAL" | "Fatal" | "INTERNAL" | "Internal"
-        );
-    Ok((message, fatal))
+    error.must_invalidate = object.read_optional_field(4, |object| object.read_bool(), false)?;
+    Ok(error)
+}
+
+/// Encodes metadata only when present, retaining legacy message-only responses.
+fn write_error_fields(object: &mut BinaryWriter, error: &crate::ServerError) -> Result<()> {
+    write_optional_string(object, 1, Some(error.message()))?;
+    write_optional_string(object, 2, error.exception_type_raw())?;
+    if !error.extra_info().is_empty() {
+        object.write_field(3, |object| {
+            object.write_uleb(error.extra_info().len() as u64)?;
+            for (key, value) in error.extra_info() {
+                object.write_object(|entry| {
+                    entry.write_field(0, |entry| entry.write_string(key))?;
+                    entry.write_field(1, |entry| entry.write_string(value))
+                })?;
+            }
+            Ok(())
+        })?;
+    }
+    if error.must_invalidate() {
+        object.write_field(4, |object| object.write_bool(true))?;
+    }
+    Ok(())
 }
