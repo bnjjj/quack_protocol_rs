@@ -115,6 +115,9 @@ fn encode_v3(message: QuackMessage) -> Result<Vec<u8>, InspectionError> {
 pub enum ControlResponse {
     Connected {
         connection_id: String,
+        /// The protocol version DuckDB agreed to, such as [`QUACK_V3`].
+        /// `None` when the reply leaves it out.
+        quack_version: Option<u64>,
         /// The heartbeat lease DuckDB agreed to: a session silent for longer
         /// expires. `None` for protocol v1, which has no heartbeats, and for a
         /// v3 reply whose value is missing or out of range.
@@ -166,6 +169,7 @@ pub fn inspect_control_response(bytes: &[u8]) -> Result<ControlResponse, Inspect
                 .map(Duration::from_secs);
             Ok(ControlResponse::Connected {
                 connection_id: header.connection_id.ok_or(InspectionError::Invalid)?,
+                quack_version,
                 heartbeat_timeout,
             })
         }
@@ -447,6 +451,7 @@ mod tests {
                 ControlResponse::Connected {
                     connection_id,
                     heartbeat_timeout,
+                    ..
                 } => {
                     assert_eq!(connection_id, "example");
                     heartbeat_timeout

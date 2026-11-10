@@ -2,7 +2,7 @@
 
 Rust client-side SDK for DuckDB's experimental Quack remote protocol.
 
-The `0.6.0` line supports both Quack protocol v1 and protocol v3 from
+The `0.7.0` line supports both Quack protocol v1 and protocol v3 from
 DuckDB 2.0:
 
 - DuckDB `BinarySerializer`-compatible primitive, object, logical type, vector, and `DataChunk` codecs.
@@ -263,8 +263,9 @@ bytes.
 `inspect_control_response` accepts only bounded complete connect, success, and
 error responses, including DuckDB's structured invalidation flag. Fatality is a
 conservative retirement signal and never authorizes replay. A connect response
-also carries the heartbeat timeout DuckDB agreed to (`None` on protocol v1): how
-long the session may stay silent before it expires.
+also carries the protocol version DuckDB agreed to, which callers can compare
+with `QUACK_V1` and `QUACK_V3`, and the heartbeat timeout it agreed to (`None` on
+protocol v1): how long the session may stay silent before it expires.
 
 `QuackError::Server` contains a `ServerError` instead of a string as of 0.6.
 Use `message()`, `exception_type()`, `extra_info()`, `error_subtype()`, and

@@ -1,5 +1,9 @@
-pub(crate) const QUACK_V1: u64 = 1;
-pub(crate) const QUACK_V3: u64 = 3;
+/// Quack protocol version 1.
+pub const QUACK_V1: u64 = 1;
+
+/// Quack protocol version 3. Unlike v1, it has CANCEL and heartbeats.
+pub const QUACK_V3: u64 = 3;
+
 pub(crate) const MIN_QUACK_VERSION: u64 = QUACK_V1;
 pub(crate) const MAX_QUACK_VERSION: u64 = QUACK_V3;
 pub(crate) const DEFAULT_QUACK_PORT: u16 = 9494;
