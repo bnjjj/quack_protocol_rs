@@ -14,7 +14,7 @@ use crate::builders::{ColumnDefinition, data_chunk_from_rows};
 use crate::constants::{
     DEFAULT_HEARTBEAT_TIMEOUT_SECS, DEFAULT_QUACK_PORT, DUCKDB_MIME_TYPE,
     MAX_HEARTBEAT_TIMEOUT_SECS, MAX_QUACK_VERSION, MIN_QUACK_VERSION, QUACK_ENDPOINT, QUACK_V1,
-    QUACK_V3,
+    QUACK_V3, QuackVersion,
 };
 use crate::errors::{MAX_HTTP_STATUS_BODY_BYTES, QuackError, Result};
 use crate::messages::{
@@ -45,8 +45,8 @@ pub struct QuackClientOptions {
     pub auth_token: Option<String>,
     pub client_duckdb_version: Option<String>,
     pub client_platform: Option<String>,
-    pub min_supported_quack_version: Option<u64>,
-    pub max_supported_quack_version: Option<u64>,
+    pub min_supported_quack_version: Option<QuackVersion>,
+    pub max_supported_quack_version: Option<QuackVersion>,
     pub client_id: Option<String>,
     pub heartbeat_timeout: Option<Duration>,
     pub ssl: Option<bool>,
@@ -111,7 +111,7 @@ impl Default for QuackClientOptions {
 pub struct QuackConnectionInfo {
     pub server_duckdb_version: Option<String>,
     pub server_platform: Option<String>,
-    pub quack_version: Option<u64>,
+    pub quack_version: Option<QuackVersion>,
     pub heartbeat_timeout: Option<Duration>,
 }
 
@@ -553,7 +553,7 @@ impl QuackClient {
 struct Connection {
     transport: Transport,
     connection_id: String,
-    quack_version: u64,
+    quack_version: QuackVersion,
     query_counter: AtomicU64,
     query_uuid_counter: AtomicU64,
     state: Arc<ConnectionState>,
@@ -606,8 +606,8 @@ impl Connection {
                                 .clone()
                                 .unwrap_or_else(|| "quack-rust".to_string()),
                         ),
-                        min_supported_quack_version: quack_version,
-                        max_supported_quack_version: quack_version,
+                        min_supported_quack_version: quack_version.number(),
+                        max_supported_quack_version: quack_version.number(),
                         client_id: options.client_id.clone(),
                         heartbeat_timeout_seconds,
                     },
@@ -642,7 +642,7 @@ impl Connection {
                     let connection_id = header.connection_id.ok_or_else(|| {
                         QuackError::protocol("CONNECTION_RESPONSE did not include a connection id")
                     })?;
-                    if selected_version != Some(quack_version) {
+                    if selected_version != Some(quack_version.number()) {
                         return Err(QuackError::protocol(format!(
                             "server selected Quack protocol version {selected_version:?}, expected {quack_version}"
                         )));
@@ -887,7 +887,11 @@ impl Transport {
         })
     }
 
-    async fn send(&self, message: &QuackMessage, quack_version: u64) -> Result<QuackMessage> {
+    async fn send(
+        &self,
+        message: &QuackMessage,
+        quack_version: QuackVersion,
+    ) -> Result<QuackMessage> {
         let bytes = encode_message_for_version(message, quack_version)?;
         let mut request = self
             .http
@@ -1531,7 +1535,7 @@ mod tests {
     // `version`. Returns a raw transport beside the client's session and that
     // session's connection ID. The ID is private to the client, which is why
     // these tests live here rather than in tests/integration.rs.
-    async fn live_session(version: u64) -> Option<(Transport, QuackClient, String)> {
+    async fn live_session(version: QuackVersion) -> Option<(Transport, QuackClient, String)> {
         let uri = std::env::var("QUACK_SERVER_URI").ok()?;
         let options = QuackClientOptions {
             auth_token: std::env::var("QUACK_AUTH_TOKEN").ok(),

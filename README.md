@@ -242,9 +242,11 @@ Quack is still experimental upstream and not yet covered by a stable official wi
 ## Compatibility
 
 The client prefers protocol v3 and retries with the separate v1 codec when an
-older server rejects the v3 handshake. `QuackConnectionInfo::quack_version`
-reports the selected version. Set `min_supported_quack_version` and
-`max_supported_quack_version` to the same value to require one version.
+older server rejects the v3 handshake. Versions are `QuackVersion` values, and
+`QUACK_V1` and `QUACK_V3` are the only ones, so no other version can be named.
+`QuackConnectionInfo::quack_version` reports the selected version. Set
+`min_supported_quack_version` and `max_supported_quack_version` to the same
+value to require one version.
 
 Protocol v1 retains its legacy prepare, fetch, and append payloads. Protocol v3
 uses query UUIDs, acknowledged fetch batches, raw chunk payloads, and connection

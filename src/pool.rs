@@ -560,7 +560,7 @@ mod tests {
                 .with_connection("leased-session"),
             server_duckdb_version: None,
             server_platform: None,
-            quack_version: Some(QUACK_V1),
+            quack_version: Some(QUACK_V1.number()),
             heartbeat_timeout_seconds: None,
         };
         let prepare_response = QuackMessage::PrepareResponse {
@@ -614,7 +614,7 @@ mod tests {
                 .with_connection(connection_id),
             server_duckdb_version: None,
             server_platform: None,
-            quack_version: Some(QUACK_V1),
+            quack_version: Some(QUACK_V1.number()),
             heartbeat_timeout_seconds: None,
         }
     }
@@ -723,7 +723,7 @@ mod tests {
                 .with_connection("possibly-stale-session"),
             server_duckdb_version: None,
             server_platform: None,
-            quack_version: Some(QUACK_V1),
+            quack_version: Some(QUACK_V1.number()),
             heartbeat_timeout_seconds: None,
         };
         let ambiguous_error = QuackMessage::ErrorResponse {
