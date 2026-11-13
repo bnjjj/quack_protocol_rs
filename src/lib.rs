@@ -28,6 +28,7 @@ pub use builders::{ColumnDefinition, ColumnInput, column, data_chunk, data_chunk
 pub use client::{
     QuackClient, QuackClientOptions, QuackConnectionInfo, QuackResultStream, QueryMetadata,
 };
+pub use constants::{QUACK_V1, QUACK_V3, QuackVersion};
 pub use errors::{
     ErrorSubtype, ExceptionType, QuackError, Result, ServerError, TransportErrorKind,
 };

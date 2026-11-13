@@ -14,7 +14,7 @@ pub use crate::messages::MessageType as Operation;
 use crate::{
     ServerError,
     binary::{BinaryReader, HugeIntParts},
-    constants::{MAX_HEARTBEAT_TIMEOUT_SECS, QUACK_V3},
+    constants::{MAX_HEARTBEAT_TIMEOUT_SECS, QUACK_V3, QuackVersion},
     messages::{self, MessageHeader as WireHeader, QuackMessage},
 };
 
@@ -115,6 +115,9 @@ fn encode_v3(message: QuackMessage) -> Result<Vec<u8>, InspectionError> {
 pub enum ControlResponse {
     Connected {
         connection_id: String,
+        /// The protocol version DuckDB agreed to. `None` when the reply
+        /// leaves it out.
+        quack_version: Option<QuackVersion>,
         /// The heartbeat lease DuckDB agreed to: a session silent for longer
         /// expires. `None` for protocol v1, which has no heartbeats, and for a
         /// v3 reply whose value is missing or out of range.
@@ -146,7 +149,7 @@ pub fn inspect_control_response(bytes: &[u8]) -> Result<ControlResponse, Inspect
         return Ok(ControlResponse::Error { error });
     }
     // These bodies are compatible across v1 and v3; v3's added fields are optional.
-    let message = messages::decode_message_for_version(bytes, crate::constants::QUACK_V3)
+    let message = messages::decode_message_for_version(bytes, QUACK_V3)
         .map_err(|_| InspectionError::Invalid)?;
     match message {
         QuackMessage::ConnectionResponse {
@@ -155,9 +158,9 @@ pub fn inspect_control_response(bytes: &[u8]) -> Result<ControlResponse, Inspect
             heartbeat_timeout_seconds,
             ..
         } => {
-            if quack_version.is_some_and(|v| v != 1 && v != 3) {
-                return Err(InspectionError::Invalid);
-            }
+            let quack_version = quack_version
+                .map(|number| QuackVersion::from_number(number).ok_or(InspectionError::Invalid))
+                .transpose()?;
             let heartbeat_timeout = heartbeat_timeout_seconds
                 .filter(|seconds| {
                     quack_version == Some(QUACK_V3)
@@ -166,6 +169,7 @@ pub fn inspect_control_response(bytes: &[u8]) -> Result<ControlResponse, Inspect
                 .map(Duration::from_secs);
             Ok(ControlResponse::Connected {
                 connection_id: header.connection_id.ok_or(InspectionError::Invalid)?,
+                quack_version,
                 heartbeat_timeout,
             })
         }
@@ -447,6 +451,7 @@ mod tests {
                 ControlResponse::Connected {
                     connection_id,
                     heartbeat_timeout,
+                    ..
                 } => {
                     assert_eq!(connection_id, "example");
                     heartbeat_timeout

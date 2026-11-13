@@ -109,7 +109,6 @@ async fn live_quack_reports_negotiated_version() -> Result<()> {
         .as_ref()
         .and_then(|info| info.quack_version)
         .expect("connected server should report its Quack protocol version");
-    assert!(matches!(version, 1 | 3));
     if let Ok(expected) = std::env::var("QUACK_EXPECTED_VERSION") {
         assert_eq!(version.to_string(), expected);
     }
@@ -583,7 +582,7 @@ async fn live_v1_appends_scalar_and_nested_rows() -> Result<()> {
     };
     assert_eq!(
         client.info.as_ref().and_then(|info| info.quack_version),
-        Some(1)
+        Some(QUACK_V1)
     );
     let table = unique_name("quack_rust_append");
     // The stream is lazy: DDL only executes once the stream is polled.
@@ -737,7 +736,7 @@ async fn live_quack_surfaces_server_errors() -> Result<()> {
             .message()
             .contains("definitely_missing_quack_rust_table")
     );
-    if client.info.as_ref().and_then(|info| info.quack_version) == Some(3) {
+    if client.info.as_ref().and_then(|info| info.quack_version) == Some(QUACK_V3) {
         assert_eq!(
             error.exception_type(),
             Some(quack_protocol::ExceptionType::Catalog)
@@ -766,8 +765,8 @@ mod connection_model {
 
     use futures_util::{StreamExt, TryStreamExt};
     use quack_protocol::{
-        QuackClient, QuackError, QuackPool, QuackPoolOptions, Result, SqlParameter, Value,
-        sql_literal,
+        QUACK_V1, QuackClient, QuackError, QuackPool, QuackPoolOptions, Result, SqlParameter,
+        Value, sql_literal,
     };
     use tokio::time::{sleep, timeout};
 
@@ -1247,11 +1246,7 @@ mod connection_model {
         .await?;
         assert_eq!(pool.max_connections(), 2);
         assert!(pool.info().is_some());
-        assert!(
-            pool.info()
-                .and_then(|info| info.quack_version)
-                .is_some_and(|version| version >= 1)
-        );
+        assert!(pool.info().and_then(|info| info.quack_version).is_some());
         pool.close().await?;
         control.disconnect().await
     }
@@ -1287,7 +1282,7 @@ mod connection_model {
         };
         assert_eq!(
             control.info.as_ref().and_then(|info| info.quack_version),
-            Some(1)
+            Some(QUACK_V1)
         );
         let uri = std::env::var("QUACK_SERVER_URI").expect("configured above");
         let pool = QuackPool::connect(&uri, live_options(), QuackPoolOptions::default()).await?;

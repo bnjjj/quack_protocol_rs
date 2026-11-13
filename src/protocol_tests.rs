@@ -239,8 +239,8 @@ fn protocol_v1_connection_request_omits_v3_lease_fields() {
         auth_string: Some("token".to_string()),
         client_duckdb_version: Some("v1.5.3".to_string()),
         client_platform: Some("linux_amd64".to_string()),
-        min_supported_quack_version: QUACK_V1,
-        max_supported_quack_version: QUACK_V1,
+        min_supported_quack_version: QUACK_V1.number(),
+        max_supported_quack_version: QUACK_V1.number(),
         client_id: Some("must-not-be-serialized".to_string()),
         heartbeat_timeout_seconds: 60,
     };
@@ -260,8 +260,8 @@ fn protocol_v1_connection_request_omits_v3_lease_fields() {
         } => {
             assert_eq!(client_id, None);
             assert_eq!(heartbeat_timeout_seconds, 0);
-            assert_eq!(min_supported_quack_version, QUACK_V1);
-            assert_eq!(max_supported_quack_version, QUACK_V1);
+            assert_eq!(min_supported_quack_version, QUACK_V1.number());
+            assert_eq!(max_supported_quack_version, QUACK_V1.number());
         }
         other => panic!("unexpected message {other:?}"),
     }
@@ -408,8 +408,8 @@ fn protocol_v3_connection_request_round_trips_lease_fields() {
         auth_string: Some("token".to_string()),
         client_duckdb_version: Some("v2.0.0-alpha39998".to_string()),
         client_platform: Some("linux_arm64".to_string()),
-        min_supported_quack_version: QUACK_V3,
-        max_supported_quack_version: QUACK_V3,
+        min_supported_quack_version: QUACK_V3.number(),
+        max_supported_quack_version: QUACK_V3.number(),
         client_id: Some("quaxy-worker".to_string()),
         heartbeat_timeout_seconds: 60,
     };

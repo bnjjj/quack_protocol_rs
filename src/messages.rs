@@ -1,5 +1,5 @@
 use crate::binary::{BinaryReader, BinaryWriter, HugeIntParts};
-use crate::constants::{OPTIONAL_INDEX_INVALID, QUACK_V1, QUACK_V3};
+use crate::constants::{OPTIONAL_INDEX_INVALID, QUACK_V1, QUACK_V3, QuackVersion};
 use crate::errors::{QuackError, Result};
 use crate::logical_types::{LogicalType, decode_logical_type, encode_logical_type};
 use crate::vector::{
@@ -184,7 +184,7 @@ pub(crate) fn encode_message(message: &QuackMessage) -> Result<Vec<u8>> {
 
 pub(crate) fn encode_message_for_version(
     message: &QuackMessage,
-    quack_version: u64,
+    quack_version: QuackVersion,
 ) -> Result<Vec<u8>> {
     let mut writer = BinaryWriter::new();
     encode_header(&mut writer, message.header())?;
@@ -205,7 +205,10 @@ pub(crate) fn decode_message(bytes: &[u8]) -> Result<QuackMessage> {
     decode_message_for_version(bytes, QUACK_V3)
 }
 
-pub(crate) fn decode_message_for_version(bytes: &[u8], quack_version: u64) -> Result<QuackMessage> {
+pub(crate) fn decode_message_for_version(
+    bytes: &[u8],
+    quack_version: QuackVersion,
+) -> Result<QuackMessage> {
     let mut reader = BinaryReader::new(bytes);
     let header = decode_header(&mut reader)?;
     let message = match quack_version {
